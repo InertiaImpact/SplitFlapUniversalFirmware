@@ -2,6 +2,9 @@
 
 Firmware for a multi-module split-flap display where each character cell is an independent ATtiny1616 microcontroller connected to a shared RS-485 bus. A Raspberry Pi (or any serial host) sends commands over the bus to drive individual cells or the whole display at once.
 
+It is designed to work with the Split-Flap display from Adam G.  See https://youtu.be/-C8_AtxEEQc?si=Gym5wikeFH2vUNRm
+The protocol is fully backward compatible.
+
 ---
 
 ## Table of Contents
