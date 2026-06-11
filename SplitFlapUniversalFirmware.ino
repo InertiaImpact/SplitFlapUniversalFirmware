@@ -1,5 +1,5 @@
 // ==============================================================================
-// Split-Flap Display Module Firmware — v12
+// Split-Flap Display Module Firmware — v13
 // ==============================================================================
 // Each module controls one character cell driven by a 28BYJ-48 stepper motor.
 // A Hall effect sensor detects a magnet on the reel to find the home position.
@@ -126,7 +126,7 @@ const uint8_t EEPROM_MAGIC = 0x5D;
 const uint8_t EEPROM_MAGIC_V8V9 = 0x5E; // recognise but migrate away from
 
 // Firmware version string returned by the 'v' command.
-const char FIRMWARE_VERSION[] = "12";
+const char FIRMWARE_VERSION[] = "13";
 
 // ── Deferred reply type — must be declared before any function that uses it ──
 // The Arduino IDE auto-generates forward declarations for all functions; if the
@@ -136,7 +136,8 @@ enum PendingReply { REPLY_NONE, REPLY_VERSION, REPLY_DUMP };
 
 const unsigned long REPLY_DIRECT_MS = 10UL;  // settling delay for direct-addressed replies
 const unsigned long REPLY_SLOT_MS   = 80UL;  // per-ID slot width for broadcast replies
-                                              // must be > worst-case TX frame time (~45 ms at 9600 baud)
+                                              // = wire time of one frame (~34 ms at 9600 baud)
+                                              //   + inter-frame gap for Pi UART (~46 ms margin)
 
 // ==========================================
 //        ATtiny1616 SERIAL NUMBER
@@ -307,7 +308,7 @@ void printModuleId() {
 
 void dumpEeprom() {
   digitalWrite(RS485_DE, HIGH);
-  delay(2);
+  delayMicroseconds(100);
 
   rs485.print("m");
   printModuleId();
@@ -329,10 +330,9 @@ void dumpEeprom() {
   }
 
   rs485.print("\n");
-  delay(45);   // wait for UART to finish clocking out at 9600 baud
   digitalWrite(RS485_DE, LOW);
-  // Flush echo bytes received while DE was HIGH.
   while (rs485.available()) rs485.read();
+  parseState = 0;
 }
 
 // ==========================================
@@ -352,15 +352,13 @@ bool sendAdvertisement() {
   }
 
   digitalWrite(RS485_DE, HIGH);
-  delay(2);
+  delayMicroseconds(100);
 
   rs485.print("mXadv:");
   rs485.print(serialStr);
   rs485.print("\n");
 
-  delay(45);   // wait for UART to finish clocking out at 9600 baud
   digitalWrite(RS485_DE, LOW);
-  // Flush echo bytes received while DE was HIGH.
   while (rs485.available()) rs485.read();
   return true;
 }
@@ -386,7 +384,7 @@ void resetProvisioning() {
 // directly from the parser so there are no blocking delays in the RX path.
 void sendVersionResponse() {
   digitalWrite(RS485_DE, HIGH);
-  delay(2);
+  delayMicroseconds(100);  // let DE line settle before first bit
   rs485.print("m");
   printModuleId();
   rs485.print("v:");
@@ -396,11 +394,13 @@ void sendVersionResponse() {
   rs485.print(":");
   rs485.print(serialStr);
   rs485.print("\n");
-  delay(45);   // wait for UART to finish clocking out at 9600 baud
+  // SoftwareSerial::print() is fully synchronous — every bit has been clocked
+  // out before we reach this line.  Drop DE immediately; no drain delay needed.
   digitalWrite(RS485_DE, LOW);
-  // Flush any bytes that were echoed into the RX buffer while DE was HIGH.
-  // Without this the parser would attempt to parse our own transmission.
+  // Flush echo bytes that accumulated in the RX buffer while DE was HIGH,
+  // and reset the parser so we start clean for the next command.
   while (rs485.available()) rs485.read();
+  parseState = 0;
 }
 
 // ==========================================
@@ -500,7 +500,7 @@ void calibrateModule() {
 
   delay(50);
   digitalWrite(RS485_DE, HIGH);
-  delay(10);
+  delayMicroseconds(100);
 
   // Response format matches v6: m<2-char-id>:<steps>\n for IDs 0-99
   rs485.print("m");
@@ -509,7 +509,6 @@ void calibrateModule() {
   rs485.print(measuredSteps);
   rs485.print("\n");
 
-  delay(45);
   digitalWrite(RS485_DE, LOW);
   while (rs485.available()) rs485.read();
 
@@ -832,13 +831,12 @@ void loop() {
 
             delay(20);
             digitalWrite(RS485_DE, HIGH);
-            delay(5);
+            delayMicroseconds(100);
             rs485.print("mXack:");
             rs485.print(serialStr);
             rs485.print(":");
             rs485.print(moduleId);
             rs485.print("\n");
-            delay(45);
             digitalWrite(RS485_DE, LOW);
             while (rs485.available()) rs485.read();
           }
