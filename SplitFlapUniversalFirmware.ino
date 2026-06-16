@@ -1,5 +1,5 @@
 // ==============================================================================
-// Split-Flap Universal Firmware — v23
+// Split-Flap Universal Firmware — v26
 // ==============================================================================
 // Each module controls one character cell driven by a 28BYJ-48 stepper motor.
 // A Hall effect sensor detects a magnet on the reel to find the home position.
@@ -35,6 +35,26 @@
 //  +<n>      Display flap at index <n>  (v7+ only; not sent by v6 code)
 //  h         Home the reel
 //  c         Calibrate revolution length and report result
+//  T         Hall sensor self-test (DIRECT-ADDRESSED ONLY).  Steps one
+//            revolution and reports sensor health:
+//              m<id>T:<code>:<edges>:<activeSamples>\n
+//            code 0=OK, 1=stuck active (shorted/jammed), 2=stuck inactive
+//            (dead/disconnected), 3=multiple active regions (noise/stray
+//            magnet), 4=inverted polarity (sensor reads active everywhere with
+//            one brief dip at the magnet — wired backwards).
+//            <edges> = home pulses seen per rev (healthy = 1); <activeSamples>
+//            = how many sampled steps read active (advisory detail).
+//  Q         Diagnostics snapshot (DIRECT-ADDRESSED ONLY, no motor movement):
+//              m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
+//            resetCause = raw RSTFR bits from last reset (0x01 power-on,
+//            0x02 brown-out, 0x04 external, 0x08 watchdog, 0x10 software);
+//            bootCount = boots since counter reset (wraps 255); vcc_mV =
+//            supply millivolts; eepromOk = 1 if EEPROM verify passed.
+//  M         Mechanical self-test (DIRECT-ADDRESSED ONLY, drives the motor):
+//              m<id>M:<code>:<measured1>:<measured2>\n
+//            code 0=OK (two rev measurements agree), 1=inconsistent (>5% apart,
+//            i.e. missed steps — drag, weak supply, failing driver), 2=no motion
+//            (motor not turning — open coil, dead driver channel, jam).
 //  o<n>      Set home offset (steps past Hall trigger to flap 0)
 //  t<n>      Set total steps per revolution
 //  s<n>      Nudge forward n steps and add to home offset
@@ -46,6 +66,18 @@
 //              m<id>d:<homeOffset>:<totalSteps>:<idx>=<pos>,<idx>=<pos>,...\n
 //            Broadcast m*d is ignored (a full dump can be ~620 ms, too long to
 //            stagger across a broadcast slot).
+//  A         Combined "all fields" dump — everything from 'v' AND 'd' in ONE
+//            message, so a client can fetch a module's complete state in a
+//            single command:
+//              m<id>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<idx>=<pos>,...\n
+//            The 'v' and 'd' commands are unchanged and remain for backward
+//            compatibility.
+//            Broadcast form is supported and staggered like 'v', with an
+//            optional ID range (each 'A' frame is long, so a full sweep is slow
+//            — prefer ranged batches on large buses):
+//              m*A\n        → all provisioned modules answer (wide slots)
+//              m*A0-49\n    → only IDs 0–49 answer
+//              m*A50-99\n   → only IDs 50–99 answer
 //  e         Erase calibrated flap position map
 //  R         Reset provisioning (erase ID, resume advertising)  [v9+]
 //  v         Report firmware version and serial number  → replies m<id>v:<version>:<moduleId>:<serialNumber>\n
@@ -64,6 +96,11 @@
 //  mXI<sn>:<id>    Assign ID by serial number  → replies mXack:<sn>:<id>
 //  mXD<sn>         Dump EEPROM config by serial number  → single-line reply,
 //                  same format as 'd'
+//  mXA<sn>         Combined all-fields dump by serial number → single-line
+//                  reply, same format as 'A'
+//  mXT<sn>         Hall sensor self-test by serial number → same reply as 'T'
+//  mXQ<sn>         Diagnostics snapshot by serial number → same reply as 'Q'
+//  mXM<sn>         Mechanical self-test by serial number → same reply as 'M'
 //  mXF<sn>         Factory-reset EEPROM by serial number (preserves module ID)
 //  mXW<sn>:<homeOffset>:<totalSteps>:<idx>=<pos>,...\n
 //                  Restore a previously dumped EEPROM onto the matching module.
@@ -87,7 +124,8 @@
 //  0x06   1    Auto-home flag (1 = home on boot)
 //  0x07   2    Saved step position (used when auto-home is off)
 //  0x09   1    Saved flap index    (used when auto-home is off)
-//  0x0A   2    (reserved / padding)
+//  0x0A   1    Boot counter (diagnostics; was reserved/padding pre-v26)
+//  0x0B   1    EEPROM health-check scratch byte (diagnostics; was reserved)
 //  0x0C  128   Calibrated step positions: 64 × uint16_t, 0xFFFF = uncalibrated
 //
 // Magic byte history — all recognised and migrated to 0x5D:
@@ -98,15 +136,48 @@
 // ==============================================================================
 // CHANGE LOG
 // ==============================================================================
-//   v23 — Current release.  Consolidates all changes since the original v6.
+//   v26 — Module hardware self-diagnostics (no protocol changes to existing
+//         commands).  All new commands have a direct m<id>X form and an
+//         mX<sn> serial-number form.
+//           'T' Hall sensor self-test — steps one revolution and reports a
+//               status code distinguishing healthy from stuck-active,
+//               stuck-inactive/disconnected, inverted-polarity, and
+//               multiple-region (noise) faults:
+//                 m<id>T:<code>:<edges>:<activeSamples>\n
+//               (0 OK, 1 stuck active, 2 dead/disconnected, 3 multiple,
+//                4 inverted polarity).  Counts over exactly one revolution
+//               from an off-magnet start so a healthy sensor reads clean.
+//           'Q' diagnostics snapshot (no motor movement) — reset cause
+//               (RSTFR), boot counter, supply voltage (mV via internal ADC
+//               reference), EEPROM write-verify, and current flap index:
+//                 m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
+//           'M' mechanical self-test — drives the motor and measures steps per
+//               revolution twice to detect missed steps (>5% disagreement) and
+//               a non-moving motor (Hall never changes → open coil/dead driver):
+//                 m<id>M:<code>:<measured1>:<measured2>\n
+//         Reset cause is captured and cleared at boot; the boot counter and an
+//         EEPROM-health scratch byte use addresses 10/11 (previously reserved
+//         padding — no change to any existing field or the flap map).
+//   v25 — Reclaimed ~600 bytes of SRAM by sharing one work buffer between the
+//         incoming mXW restore payload and the outgoing d/A dump assembly (they
+//         never overlap in time).  Cleared the IDE's low-memory warning.
+//   v24 — Consolidates all changes since the original v6.
+//         New in v24 specifically:
+//           - 'A' combined all-fields dump: version + EEPROM state in ONE
+//             message (m<id>A, broadcast-staggered m*A with optional ID range,
+//             and mXA<sn> by serial number).  'v' and 'd' remain unchanged.
+//           - Negative nudge ('s' command) now works on the one-way reel.
+//           - All user-editable settings gathered into one USER CONFIGURATION
+//             block at the top (firmware version, pins, flap count, motor speed,
+//             advertisement and broadcast-reply timing, watchdog timeout).
 //         Functional additions since v6:
 //           - Dynamic module IDs via the ATtiny SIGROW serial number, with
 //             advertisement of unprovisioned modules and serial-number-based
-//             provisioning commands (mXH/mXI/mXD/mXF/mXW).
+//             provisioning commands (mXH/mXI/mXD/mXF/mXW/mXA).
 //           - Variable-length address parser (v6 two-char zero-padded format
 //             still accepted); '+' index command; 'v' version report; 'F'
 //             factory-reset; 'R' de-provision; 'd' single-line EEPROM dump.
-//           - Scalable broadcast version query (m*v with optional <lo>-<hi>
+//           - Scalable broadcast queries (m*v / m*A with optional <lo>-<hi>
 //             range) for polling large buses in retryable batches.
 //         EEPROM compatibility:
 //           - Layout unchanged since v6.  Magic 0x5D (v6) and 0x5E (v8/v9) both
@@ -119,8 +190,8 @@
 //           - Bounded all motor/Hall wait loops; calibration is sanity-checked.
 //           - homeModule() reports failure instead of faking a known position.
 //           - Capped startup stagger; advertisements paused during m* sweeps.
-//           - Broadcast reply slotting (100 ms slots) and DE timing tuned for
-//             reliable multi-module replies; direct v/d reply synchronously.
+//           - Broadcast reply slotting and DE timing tuned for reliable
+//             multi-module replies; direct v/d/A reply synchronously.
 // ==============================================================================
 
 #include <SoftwareSerial.h>
@@ -135,18 +206,74 @@
 // prototyped before this enum exists, compilation fails with
 // "PendingReply was not declared in this scope".  Keeping the enum here, ahead of
 // all other declarations, guarantees the generated prototypes can see it.
-enum PendingReply { REPLY_NONE, REPLY_VERSION };
+enum PendingReply { REPLY_NONE, REPLY_VERSION, REPLY_ALL };
+
+// ==============================================================================
+// ████  USER CONFIGURATION  —  edit these to match your hardware / preferences ██
+// ==============================================================================
+// Everything a typical user might want to change by hand is gathered here.
+// Lower-level implementation constants (EEPROM addresses, buffer sizes, the
+// EEPROM magic byte) live further down and normally should NOT be touched.
+
+// ── Firmware version ──────────────────────────────────────────────────────────
+// Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
+const char FIRMWARE_VERSION[] = "26";
+
+// ── Pin assignments ───────────────────────────────────────────────────────────
+// RS-485 transceiver
+const int RS485_RX = 3;     // microcontroller RX  (from transceiver RO)
+const int RS485_TX = 1;     // microcontroller TX  (to   transceiver DI)
+const int RS485_DE = 2;     // driver enable       (HIGH = transmit)
+// Stepper coils (via ULN2003 or similar)
+#define IN1 9
+#define IN2 8
+#define IN3 7
+#define IN4 6
+// Hall-effect home sensor (active LOW)
+#define HALL_PIN 4
+
+// ── Mechanical ────────────────────────────────────────────────────────────────
+#define NUM_FLAPS 64        // number of physical flaps on the reel
+const int stepDelay = 1;    // ms between half-steps (lower = faster, less torque)
+
+// ── Advertisement timing (unprovisioned modules) ─────────────────────────────
+const unsigned long ADVERTISE_BASE_MS   = 10000UL; // base interval between adverts
+const unsigned long ADVERTISE_JITTER_MS =  5000UL; // max extra random jitter
+
+// ── Broadcast reply slot timing ──────────────────────────────────────────────
+// When many modules answer one broadcast (m*v / m*A) each transmits in its own
+// time slot indexed by module ID.  A slot MUST be comfortably wider than the
+// worst-case frame time at 9600 baud or adjacent frames collide:
+//   * a version  ('v') frame is ~40 ms  → REPLY_SLOT_MS     = 100 ms
+//   * a combined ('A') frame is ~570 ms → REPLY_ALL_SLOT_MS = 700 ms
+// REPLY_DIRECT_MS is the settling delay before a direct (non-broadcast) reply.
+// REPLY_LEADIN_MS is a fixed offset before the first broadcast slot so the
+// lowest ID waits for the controller's transceiver turnaround.
+const unsigned long REPLY_DIRECT_MS   =  30UL;
+const unsigned long REPLY_SLOT_MS     = 100UL;
+const unsigned long REPLY_ALL_SLOT_MS = 700UL;
+const unsigned long REPLY_LEADIN_MS   =  30UL;
+
+// ── Carrier-sense window before transmitting an advertisement (ms) ───────────
+const unsigned long CSMA_LISTEN_MS = 20UL;
+
+// ── Watchdog timeout ──────────────────────────────────────────────────────────
+// Must exceed the longest blocking section between wdt_reset() calls.  Long
+// motor moves call wdt_reset() internally, so this only needs to cover a normal
+// loop iteration with margin.
+#define WDT_TIMEOUT WDTO_2S
+// ==============================================================================
+// ████  END USER CONFIGURATION  ████████████████████████████████████████████████
+// ==============================================================================
+
 
 // ==========================================
-//            CONFIGURATION
+//            FLAP CHARACTER SET
 // ==========================================
-// Number of physical flaps on the reel.  Single source of truth — used for the
-// bounds check in moveToIndex and every loop over the EEPROM flap map.
-#define NUM_FLAPS 64
-
 // Ordered set of characters on the reel (index = physical flap position).
 // Stored in flash (PROGMEM) rather than as an Arduino String to avoid using
-// SRAM/heap on the 2 KB-SRAM ATtiny1616.
+// SRAM/heap on the 2 KB-SRAM ATtiny1616.  If you change this, keep its length
+// equal to NUM_FLAPS (set in USER CONFIGURATION above).
 const char FLAP_CHARS[] PROGMEM =
   " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw";
 
@@ -161,58 +288,18 @@ int flapIndexOf(char target) {
   return -1;
 }
 
-// Watchdog timeout. Must exceed the longest single blocking section between
-// wdt_reset() calls.  The long motor moves call wdt_reset() internally, so this
-// only needs to cover a normal loop iteration with margin.
-#define WDT_TIMEOUT WDTO_2S
-
-// Advertisement timing
-const unsigned long ADVERTISE_BASE_MS   = 10000UL; // base interval
-const unsigned long ADVERTISE_JITTER_MS =  5000UL; // max extra jitter
-
-// ── Broadcast reply timing ────────────────────────────────────────────────────
-// When many modules answer one broadcast (m*v) each transmits in its own time
-// slot indexed by module ID:  replyTime = commandTime + (id - lo) × REPLY_SLOT_MS.
-//
-// SLOT WIDTH — this is the critical reliability parameter.
-//   A version frame "m200v:16:200:<20 hex>\n" is up to ~38 characters.
-//   At 9600 baud (10 bits/char) that is 38 × 10 / 9600 ≈ 40 ms ON THE WIRE.
-//   The ATtiny1616 runs on its internal oscillator with ±2-3% tolerance, so
-//   two modules' 45 ms timers could differ by 2-3 ms, and the MAX485 DE line
-//   has its own enable/disable propagation.  A slot only a few ms larger than
-//   the frame therefore collapses under drift and frames collide — which is
-//   why even 7 modules were unreliable.
-//
-//   REPLY_SLOT_MS is set to comfortably MORE THAN TWICE the worst-case frame
-//   time so that even with maximum drift, DE turnaround, and a late loop tick,
-//   each module's frame finishes well inside its own slot with the next slot
-//   still empty.  100 ms → ~60 ms of guard after a 40 ms frame.
-const unsigned long REPLY_DIRECT_MS = 30UL;   // settling delay before a direct-addressed reply.
-                                              // Must be long enough for the controller's RS-485
-                                              // transceiver to finish transmitting the command and
-                                              // switch to receive before the module answers.  10 ms
-                                              // was too tight for some USB-RS485 adapters, which made
-                                              // fast/low-ID replies (e.g. m0v) get clipped.
-const unsigned long REPLY_SLOT_MS   = 100UL;  // per-ID slot width for broadcast replies
-                                              // (must be ≫ worst-case frame time of ~40 ms)
-const unsigned long REPLY_LEADIN_MS = 30UL;   // fixed offset before the FIRST broadcast slot, so the
-                                              // lowest ID (slot 0, e.g. module 0 on m*v) waits for the
-                                              // controller's transceiver turnaround before replying.
-
-// ── Ranged broadcast version query ────────────────────────────────────────────
-// Command form:  m*v<lo>-<hi>\n   (e.g. "m*v0-49\n")
-// Only modules whose ID is within [lo, hi] respond.  Their slot is computed
-// relative to lo:  replyTime = commandTime + (moduleId - lo) × REPLY_SLOT_MS,
-// so each batch starts answering immediately and a 50-wide batch completes in
-// ~2.25 s regardless of where in the ID space it sits.  The Pi polls the bus
-// one batch at a time and re-issues any batch that comes back short.
-//
-// Plain "m*v\n" with no range still works and is equivalent to m*v0-254.
+// ── Ranged broadcast query state (runtime, not user-config) ───────────────────
+// Command form:  m*v<lo>-<hi>\n  or  m*A<lo>-<hi>\n  (e.g. "m*v0-49\n")
+// Only modules whose ID is within [lo, hi] respond, each in a slot relative to
+// lo, so the controller can poll the bus one batch at a time and re-issue any
+// batch that comes back short.  Plain "m*v\n" / "m*A\n" = the full 0-254 range.
 int  replyRangeLo = 0;    // inclusive low bound for the current ranged query
 int  replyRangeHi = 254;  // inclusive high bound for the current ranged query
 
-// Carrier-sense window before transmitting (ms)
-const unsigned long CSMA_LISTEN_MS = 20UL;
+// Which reply type a broadcast range query (state 18) should schedule once the
+// optional "<lo>-<hi>" range has been parsed.  Set when entering state 18 from
+// either 'v' (REPLY_VERSION) or 'A' (REPLY_ALL).
+PendingReply broadcastReplyType = REPLY_VERSION;
 
 // ---- EEPROM addresses (unchanged from v6) ----
 const int ADDR_INIT        = 0;
@@ -222,15 +309,17 @@ const int ADDR_MODULE_ID   = 5;
 const int ADDR_AUTO_HOME   = 6;
 const int ADDR_SAVED_POS   = 7;
 const int ADDR_SAVED_INDEX = 9;
+// Addresses 10 and 11 were "reserved / padding" in the v6 layout (between the
+// saved index at 9 and the flap map at 12).  v26 puts them to use for
+// diagnostics WITHOUT disturbing any existing field or the map start:
+const int ADDR_BOOT_COUNT  = 10;  // 1 byte, wraps at 255 — boots since last reset to 0
+const int ADDR_EE_SCRATCH  = 11;  // 1 byte, used by the EEPROM write-read-verify health check
 const int ADDR_MAP_START   = 12;
 
 // The one valid magic value for the current layout (same as v6).
 // 0x5E (written by v8/v9) is treated as equivalent during migration.
 const uint8_t EEPROM_MAGIC = 0x5D;
 const uint8_t EEPROM_MAGIC_V8V9 = 0x5E; // recognise but migrate away from
-
-// Firmware version string returned by the 'v' command.
-const char FIRMWARE_VERSION[] = "23";
 
 // ==========================================
 //        ATtiny1616 SERIAL NUMBER
@@ -249,8 +338,7 @@ void readSerialNumber() {
     serialStr[i * 2]     = hi < 10 ? ('0' + hi) : ('A' + hi - 10);
     serialStr[i * 2 + 1] = lo < 10 ? ('0' + lo) : ('A' + lo - 10);
   }
-  serialStr[SERIAL_LEN * 2] = '\0';
-}
+  serialStr[SERIAL_LEN * 2] = '\0';}
 
 bool serialMatches(const char *candidate) {
   // Must be exactly the serial-number length
@@ -265,6 +353,62 @@ bool serialMatches(const char *candidate) {
   }
   return true;
 }
+
+// ==========================================
+//        DIAGNOSTICS  (registers & state)
+// ==========================================
+// ATtiny1616 reset-flag register: RSTCTRL.RSTFR (provided by the core headers).
+// Each bit latches the cause of the most recent reset until cleared; we read
+// and clear it once at boot so the 'Q' diagnostics command can report why the
+// module last reset.
+//   bit0 PORF  power-on    bit1 BORF  brown-out   bit2 EXTRF external
+//   bit3 WDRF  watchdog    bit4 SWRF  software     bit5 UPDIRF UPDI
+
+uint8_t resetCause = 0;          // captured at boot, raw RSTFR bits
+uint8_t bootCount  = 0;          // ADDR_BOOT_COUNT, incremented each boot (wraps)
+
+// Read the ATtiny1616 supply voltage (VCC) in millivolts using the ADC with the
+// internal 1.1 V reference measured against VDD.  Returns 0 if unsupported.
+// On the megaTinyCore the simplest portable route is analogReadEnh / the core's
+// internal-reference helpers, but to avoid depending on a specific core version
+// we use the documented ADC0 path: measure the internal reference relative to
+// VDD, then VCC = 1024 * 1100mV / adc_reading (10-bit).
+uint16_t readVccMillivolts() {
+  // Select VDD as reference, internal reference (1.1V) as the input channel.
+  // Register details per ATtiny1616 datasheet (ADC0).
+  VREF.CTRLA = (VREF.CTRLA & ~VREF_ADC0REFSEL_gm) | VREF_ADC0REFSEL_1V1_gc;
+  ADC0.CTRLC = ADC_PRESC_DIV16_gc | ADC_REFSEL_VDDREF_gc | ADC_SAMPCAP_bm;
+  ADC0.MUXPOS = ADC_MUXPOS_INTREF_gc;     // measure the internal reference
+  ADC0.CTRLA  = ADC_ENABLE_bm;            // 10-bit, single-ended
+
+  // Discard one conversion after switching reference (settling), then average a few.
+  uint32_t acc = 0;
+  for (uint8_t i = 0; i < 5; i++) {
+    ADC0.COMMAND = ADC_STCONV_bm;
+    while (ADC0.COMMAND & ADC_STCONV_bm) { /* wait */ }
+    uint16_t r = ADC0.RES;
+    if (i > 0) acc += r;                   // skip the first (settling) sample
+  }
+  uint16_t adc = acc / 4;
+  if (adc == 0) return 0;
+  // VCC = (1024 * 1100) / adc   (1.1V internal ref, 10-bit full scale = 1024)
+  return (uint16_t)((1024UL * 1100UL) / adc);
+}
+
+// EEPROM write-read-verify health check on a dedicated scratch byte.
+// Writes a known pattern, reads it back, restores the previous value.
+// Returns true if the cell read back correctly.
+bool eepromHealthOk() {
+  uint8_t saved = EEPROM.read(ADDR_EE_SCRATCH);
+  const uint8_t pattern = 0xA5;
+  EEPROM.write(ADDR_EE_SCRATCH, pattern);
+  bool ok1 = (EEPROM.read(ADDR_EE_SCRATCH) == pattern);
+  EEPROM.write(ADDR_EE_SCRATCH, (uint8_t)~pattern);
+  bool ok2 = (EEPROM.read(ADDR_EE_SCRATCH) == (uint8_t)~pattern);
+  EEPROM.write(ADDR_EE_SCRATCH, saved);    // restore
+  return ok1 && ok2;
+}
+
 
 // ==========================================
 //       PSEUDO-RANDOM (LCG, seeded from SN)
@@ -307,19 +451,6 @@ void updateIdChars() {
 }
 
 // ==========================================
-//          PIN DEFINITIONS
-// ==========================================
-const int RS485_RX = 3;
-const int RS485_TX = 1;
-const int RS485_DE = 2;
-
-#define IN1 9
-#define IN2 8
-#define IN3 7
-#define IN4 6
-#define HALL_PIN 4
-
-// ==========================================
 //               GLOBALS
 // ==========================================
 SoftwareSerial rs485(RS485_RX, RS485_TX);
@@ -329,8 +460,6 @@ int  currentPhase     = 0;
 int  parseState       = 0;
 int  currentFlapIndex = -1;
 int  tempIndex        = -1;
-
-const int stepDelay = 1;
 
 // ── Fixed-size parser accumulators (no Arduino String / no heap) ──────────────
 // Maximum field sizes are bounded by the protocol:
@@ -345,10 +474,25 @@ const int stepDelay = 1;
 #define SNBUF_MAX   20
 #define RESTORE_MAX 600
 
+// ── Shared large work buffer ──────────────────────────────────────────────────
+// One buffer serves BOTH the incoming mXW restore payload AND the outgoing d/A
+// dump assembly.  These never overlap in time: a restore payload is consumed
+// the instant its terminator arrives (parse state 17), and the dump commands
+// run in unrelated parser states — a module is never receiving a restore while
+// transmitting a dump.  Sharing one buffer instead of two saves ~600 bytes of
+// the ATtiny1616's 2 KB SRAM.  Sized to the larger of the two needs.
+#define DUMP_BUF_SIZE 720
+#if (RESTORE_MAX + 1) > DUMP_BUF_SIZE
+  #error "WORK_BUF too small for restore payload"
+#endif
+static char workBuf[DUMP_BUF_SIZE];
+
+// restoreBuf is an alias into the shared buffer (used while accumulating mXW).
+char *const restoreBuf = workBuf;  int restoreLen = 0;
+
 char idBuf[IDBUF_MAX + 1];        int idLen = 0;
 char numBuf[NUMBUF_MAX + 1];      int numLen = 0;
 char snBuf[SNBUF_MAX + 1];        int snLen = 0;
-char restoreBuf[RESTORE_MAX + 1]; int restoreLen = 0;
 
 bool   idWildcard  = false;
 bool   idProvision = false;
@@ -402,7 +546,7 @@ void schedulePendingReply(PendingReply type, bool isBroadcast) {
       return;
     }
     // Broadcast slot timing:
-    //   replyTime = now + REPLY_LEADIN_MS + (id - lo) × REPLY_SLOT_MS
+    //   replyTime = now + REPLY_LEADIN_MS + (id - lo) × slotWidth
     //
     // REPLY_LEADIN_MS is a fixed offset applied to EVERY module so that even
     // the lowest ID in the range (slot 0, e.g. module 0 on a full m*v) does not
@@ -410,8 +554,13 @@ void schedulePendingReply(PendingReply type, bool isBroadcast) {
     // and switched its transceiver to receive.  Previously the lowest ID used a
     // +1 slot for this purpose, but a dedicated lead-in is clearer and keeps the
     // slot index aligned with the ID offset (id 0 → slot 0, id 1 → slot 1, ...).
+    //
+    // The slot WIDTH depends on the reply type: the combined 'A' dump frame is
+    // an order of magnitude longer than a version frame, so it needs a much
+    // wider slot to avoid adjacent frames overlapping.
+    unsigned long slotWidth = (type == REPLY_ALL) ? REPLY_ALL_SLOT_MS : REPLY_SLOT_MS;
     unsigned long slot = REPLY_LEADIN_MS +
-                         (unsigned long)(moduleId - replyRangeLo) * REPLY_SLOT_MS;
+                         (unsigned long)(moduleId - replyRangeLo) * slotWidth;
     pendingReplyTime = millis() + slot;
   } else {
     pendingReplyTime = millis() + REPLY_DIRECT_MS;
@@ -482,12 +631,13 @@ void printModuleId() {
 //    ATtiny1616's 2 KB SRAM (or fragmenting the heap) when many flap entries were
 //    populated, which made the dump silently produce nothing.
 //
-// Worst case (all 64 entries, 3-digit ID): ~595 bytes.  The buffer is sized to
-// 640 to leave headroom and a guaranteed null terminator.
-#define DUMP_BUF_SIZE 640
+// Worst case for the plain 'd' dump (all 64 entries, 3-digit ID): ~595 bytes.
+// The combined 'A' message adds version + serial + autohome + curindex (~31
+// bytes more) and still fits the shared workBuf (DUMP_BUF_SIZE, declared with
+// the parser buffers above) with headroom and a guaranteed null terminator.
 
 void dumpEeprom() {
-  static char buf[DUMP_BUF_SIZE];   // static: not on the stack, not the heap
+  char *buf = workBuf;              // shared work buffer (see declaration above)
   int n = 0;                        // current write index into buf
 
   // ── Header: m<id>d:<homeOffset>:<totalSteps>: ────────────────────────
@@ -523,6 +673,75 @@ void dumpEeprom() {
   delay(2);                         // hold until final stop bit is on the wire
   digitalWrite(RS485_DE, LOW);
   while (rs485.available()) rs485.read();   // discard self-echo
+  parseState = 0;
+}
+
+// ==========================================
+//      COMBINED "ALL FIELDS" DUMP  ('A')
+// ==========================================
+// Single message containing EVERYTHING a client could need about a module:
+// all fields from the 'v' (version) response AND all fields from the 'd'
+// (EEPROM dump) response, so a client can fetch a module's complete state in
+// one command instead of two.  The 'v' and 'd' commands are unchanged and
+// remain for backward compatibility.
+//
+// Reply format (single line):
+//   m<id>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<idx>=<pos>,<idx>=<pos>,...\n
+//
+// Field-by-field:
+//   <version>       firmware version string            (from 'v')
+//   <moduleId>      bus ID, 255 = unprovisioned        (from 'v')
+//   <serialNumber>  20-hex ATtiny serial number        (from 'v')
+//   <homeOffset>    steps from Hall trigger to flap 0  (from 'd')
+//   <totalSteps>    steps per revolution               (from 'd')
+//   <autoHome>      1 = home on boot, 0 = restore      (new — was implicit)
+//   <curIndex>      current flap index, -1 if unknown  (new — live state)
+//   <idx>=<pos>,... calibrated flap map (only populated entries; from 'd')
+//
+// Example (full map omitted for brevity):
+//   m38A:23:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342\n
+//
+// Like dumpEeprom(), the whole line is assembled into a fixed buffer with all
+// EEPROM reads done BEFORE the driver is enabled, then sent as one tight burst.
+void dumpAll() {
+  char *buf = workBuf;              // shared work buffer (see declaration above)
+  int n = 0;
+
+  // ── Header + scalar fields (all reads done before DE is asserted) ────
+  buf[n++] = 'm';
+  if (moduleId < 10) buf[n++] = '0';
+  n += snprintf(&buf[n], DUMP_BUF_SIZE - n, "%u", (unsigned)moduleId);
+  n += snprintf(&buf[n], DUMP_BUF_SIZE - n, "A:%s:%u:%s:%d:%d:%d:%d:",
+                FIRMWARE_VERSION,
+                (unsigned)moduleId,
+                serialStr,
+                stepsFromHallToZero,
+                totalStepsPerRev,
+                autoHomeEnabled ? 1 : 0,
+                currentFlapIndex);
+
+  // ── Flap map (only populated entries) ────────────────────────────────
+  bool first = true;
+  for (int i = 0; i < NUM_FLAPS; i++) {
+    uint16_t pos = 0xFFFF;
+    EEPROM.get(ADDR_MAP_START + (i * 2), pos);
+    if (pos == 0xFFFF) continue;
+    if (n > DUMP_BUF_SIZE - 12) break;     // overflow guard
+    if (!first) buf[n++] = ',';
+    n += snprintf(&buf[n], DUMP_BUF_SIZE - n, "%d=%u", i, (unsigned)pos);
+    first = false;
+  }
+
+  buf[n] = '\0';
+
+  // ── Transmit in one burst ────────────────────────────────────────────
+  digitalWrite(RS485_DE, HIGH);
+  delayMicroseconds(200);
+  rs485.print(buf);
+  rs485.print("\n");
+  delay(2);
+  digitalWrite(RS485_DE, LOW);
+  while (rs485.available()) rs485.read();
   parseState = 0;
 }
 
@@ -832,6 +1051,239 @@ void calibrateModule() {
   saveState();
 }
 
+// ==========================================
+//          HALL SENSOR SELF-TEST  ('T')
+// ==========================================
+// Actively probes the Hall home sensor and reports a status code so a
+// controller can detect a malfunctioning, disconnected, or mis-wired sensor
+// without having to infer it from calibration numbers.
+//
+// Method: step one full revolution (plus a margin) and watch the sensor.
+//   - count how many SAMPLES read active           (activeSamples)
+//   - count how many inactive→active TRANSITIONS    (edges = home pulses/rev)
+// A healthy sensor produces exactly ONE active region per revolution: a modest
+// run of active samples bracketed by inactive samples, i.e. edges == 1.
+//
+// Status codes (reported as m<id>T:<code>:<edges>:<activeSamples>\n):
+//   0  OK            edges == 1 and the active region is a sane width
+//   1  STUCK_ACTIVE  sensor active for (nearly) the whole revolution
+//                    → shorted, magnet jammed at sensor, or mis-wiring
+//   2  STUCK_INACTIVE never went active across a full revolution
+//                    → disconnected, dead, missing magnet, or inverted polarity
+//   3  MULTIPLE       more than one active region per revolution
+//                    → stray magnet, electrical noise, or a chattering sensor
+//
+// The extra <edges> and <activeSamples> fields are advisory detail; a client
+// that only cares about pass/fail can look at <code> alone.  The test leaves
+// the reel re-homed (or flagged unknown) afterward, like calibrate does.
+void hallSelfTest() {
+  // Probe over EXACTLY one revolution.  Counting over more than one rev would
+  // cross the single home region twice and make a healthy sensor look like it
+  // has multiple active regions.
+  //
+  // Before counting, step to a known INACTIVE start so the home region isn't
+  // split across the count's start/end boundary (which would miscount edges).
+  // Bounded so a stuck-active sensor can't spin here forever.
+  long runIn = 0;
+  long runInMax = (long)totalStepsPerRev + (totalStepsPerRev / 10);
+  while (hallActive() && runIn < runInMax) { stepBackward(1); runIn++; }
+  // (If the sensor is stuck active, runIn saturates and we start anyway; the
+  //  classification below still flags it correctly as STUCK_ACTIVE.)
+
+  long activeSamples  = 0;
+  int  risingEdges    = 0;   // inactive → active transitions
+  int  fallingEdges   = 0;   // active → inactive transitions
+  bool prevActive     = hallActive();
+  if (prevActive) activeSamples++;
+
+  for (long i = 0; i < (long)totalStepsPerRev; i++) {
+    stepBackward(1);
+    bool now = hallActive();
+    if (now) activeSamples++;
+    if ( now && !prevActive) risingEdges++;   // inactive → active
+    if (!now &&  prevActive) fallingEdges++;   // active  → inactive
+    prevActive = now;
+  }
+  releaseMotor();
+
+  // Thresholds (10% of a revolution).  A healthy home magnet covers only a
+  // small fraction of the revolution, so "most of the rev" vs "a brief region"
+  // are far apart and unambiguous.
+  long mostlyActive = (long)totalStepsPerRev - (totalStepsPerRev / 10);  // ≥90% active
+  long briefRegion  = totalStepsPerRev / 10;                              // ≤10% active
+
+  // Classify:
+  //   0 OK             one short active region          (active LOW at magnet)
+  //   1 STUCK_ACTIVE   active the whole rev, NO dips     (shorted / jammed)
+  //   2 STUCK_INACTIVE never active                      (dead / disconnected)
+  //   3 MULTIPLE       more than one active region       (noise / stray magnet)
+  //   4 INVERTED       active most of the rev with ONE   (sensor wired with
+  //                    brief inactive dip at the magnet   reversed polarity)
+  //
+  // The inverted case is the mirror image of OK: instead of one brief ACTIVE
+  // region in an inactive background, it shows one brief INACTIVE region in an
+  // active background.  We detect that as "mostly active, but it did fall
+  // inactive exactly once" — distinct from stuck-active, which never falls.
+  uint8_t code;
+  if (activeSamples == 0) {
+    code = 2;  // STUCK_INACTIVE — never asserted at all
+  } else if (activeSamples >= mostlyActive) {
+    // Active for ~the whole revolution.  Did it ever dip inactive?
+    if (fallingEdges >= 1 &&
+        ((long)totalStepsPerRev - activeSamples) <= briefRegion) {
+      code = 4;  // INVERTED_POLARITY — one brief inactive dip in an active field
+    } else {
+      code = 1;  // STUCK_ACTIVE — never released
+    }
+  } else if (risingEdges > 1) {
+    code = 3;  // MULTIPLE active regions
+  } else {
+    code = 0;  // OK — exactly one active region of sane width
+  }
+
+  // ── Transmit: m<id>T:<code>:<risingEdges>:<activeSamples>\n ──────────
+  digitalWrite(RS485_DE, HIGH);
+  delayMicroseconds(200);
+  rs485.print("m");
+  printModuleId();
+  rs485.print("T:");
+  rs485.print(code);
+  rs485.print(":");
+  rs485.print(risingEdges);
+  rs485.print(":");
+  rs485.print(activeSamples);
+  rs485.print("\n");
+  delay(2);
+  digitalWrite(RS485_DE, LOW);
+  while (rs485.available()) rs485.read();
+
+  // Leave the module in a known state.
+  homeModule();
+  saveState();
+  parseState = 0;
+}
+
+// ==========================================
+//        DIAGNOSTICS REPORT  ('Q')
+// ==========================================
+// Instantaneous health snapshot — no motor movement.  Reports:
+//   m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
+//     resetCause  raw RSTFR bits from the last reset (see RSTCTRL.RSTFR notes;
+//                 e.g. 0x08 = watchdog, 0x02 = brown-out, 0x01 = power-on)
+//     bootCount   boots since the counter was last reset (wraps at 255)
+//     vcc_mV      measured supply voltage in millivolts (0 if unavailable)
+//     eepromOk    1 = EEPROM scratch cell write-read-verify passed, else 0
+//     curIndex    current flap index (-1 = unknown / needs homing)
+// A controller can watch for: a non-zero watchdog/brown-out reset bit, a VCC
+// sagging below ~4.5 V under load, eepromOk == 0, or a climbing bootCount that
+// indicates the module is silently resetting in the field.
+void reportDiagnostics() {
+  uint16_t vcc = readVccMillivolts();
+  uint8_t  eeOk = eepromHealthOk() ? 1 : 0;
+
+  digitalWrite(RS485_DE, HIGH);
+  delayMicroseconds(200);
+  rs485.print("m");
+  printModuleId();
+  rs485.print("Q:");
+  rs485.print(resetCause);
+  rs485.print(":");
+  rs485.print(bootCount);
+  rs485.print(":");
+  rs485.print(vcc);
+  rs485.print(":");
+  rs485.print(eeOk);
+  rs485.print(":");
+  rs485.print(currentFlapIndex);
+  rs485.print("\n");
+  delay(2);
+  digitalWrite(RS485_DE, LOW);
+  while (rs485.available()) rs485.read();
+  parseState = 0;
+}
+
+// ==========================================
+//        MECHANICAL SELF-TEST  ('M')
+// ==========================================
+// Active test that drives the motor to detect missed steps (mechanical drag,
+// slipping coupler, weak supply, failing driver) and a non-moving motor (open
+// coil / dead driver channel).  Reports:
+//   m<id>M:<code>:<measured1>:<measured2>\n
+//     code 0 = OK            two revolution measurements agree closely
+//          1 = INCONSISTENT  the two measurements differ by >5% → missed steps
+//          2 = NO_MOTION     the Hall reading never changed while driving →
+//                            motor isn't turning (open coil, dead driver, jam)
+//     measured1, measured2 = the two measured steps-per-revolution counts
+//
+// Method: home, then measure steps-from-edge-to-edge twice.  A healthy module
+// returns two nearly-identical counts.  Significant disagreement means steps
+// are being lost; no Hall transition at all means the motor never moved.
+//
+// Returns the module re-homed afterward.
+static long measureOneRev() {
+  // From somewhere off the magnet, step until the magnet edge, counting steps
+  // for one full revolution back to the next edge.  Bounded for safety.
+  long safety = 0;
+  // ensure we start off-magnet
+  while (hallActive() && safety < (totalStepsPerRev + 500)) { stepBackward(1); safety++; }
+  // advance to the first edge
+  safety = 0;
+  while (!hallActive() && safety < (totalStepsPerRev + 500)) { stepBackward(1); safety++; }
+  // step through the magnet region
+  safety = 0;
+  while (hallActive() && safety < 2000) { stepBackward(1); safety++; }
+  // count a full revolution until we return through the magnet
+  long count = 0;
+  while (!hallActive() && count < (totalStepsPerRev * 2 + 1000)) { stepBackward(1); count++; }
+  long s2 = 0;
+  while (hallActive() && s2 < 2000) { stepBackward(1); count++; s2++; }
+  return count;
+}
+
+void mechanicalTest() {
+  // Detect "no motion": sample the Hall line across a commanded move and see if
+  // it ever changes.  If the motor is energised but not turning, the sensor
+  // reading is constant.
+  bool startState = hallActive();
+  bool changed = false;
+  for (int i = 0; i < totalStepsPerRev / 4; i++) {  // quarter rev is plenty
+    stepBackward(1);
+    if (hallActive() != startState) { changed = true; break; }
+  }
+
+  uint8_t code;
+  long m1 = 0, m2 = 0;
+  if (!changed) {
+    code = 2;  // NO_MOTION — sensor never changed while driving
+  } else {
+    m1 = measureOneRev();
+    m2 = measureOneRev();
+    long diff = m1 > m2 ? (m1 - m2) : (m2 - m1);
+    long tol  = (m1 > m2 ? m1 : m2) / 20;   // 5% tolerance
+    code = (diff <= tol) ? 0 : 1;           // 0 OK, 1 INCONSISTENT
+  }
+  releaseMotor();
+
+  digitalWrite(RS485_DE, HIGH);
+  delayMicroseconds(200);
+  rs485.print("m");
+  printModuleId();
+  rs485.print("M:");
+  rs485.print(code);
+  rs485.print(":");
+  rs485.print(m1);
+  rs485.print(":");
+  rs485.print(m2);
+  rs485.print("\n");
+  delay(2);
+  digitalWrite(RS485_DE, LOW);
+  while (rs485.available()) rs485.read();
+
+  homeModule();
+  saveState();
+  parseState = 0;
+}
+
 void moveToIndex(int targetIndex) {
   if (targetIndex < 0 || targetIndex >= NUM_FLAPS) return;
   if (currentFlapIndex == targetIndex) return;
@@ -867,6 +1319,12 @@ void moveToChar(char targetChar) {
 //               SETUP
 // ==========================================
 void setup() {
+  // Capture WHY we just reset (RSTFR latches the cause) before anything clears
+  // it, then clear it by writing the bits back so the next reset's cause is
+  // recorded cleanly.  Reported later by the 'Q' diagnostics command.
+  resetCause = RSTCTRL.RSTFR;
+  RSTCTRL.RSTFR = resetCause;   // writing 1s clears the latched flags
+
   // Disable the watchdog early in case we got here via a WDT reset (the flag
   // can leave the WDT running on some AVRs), then configure it fresh below.
   wdt_disable();
@@ -955,6 +1413,14 @@ void setup() {
     if (currentFlapIndex < -1 || currentFlapIndex >= NUM_FLAPS) currentFlapIndex = -1;
   }
 
+  // ── Boot counter (diagnostics) ─────────────────────────────────────────────
+  // Increment a wrapping count of boots so the 'Q' command can reveal a module
+  // that is silently resetting in the field.  Uses the wear-saving updater.
+  bootCount = EEPROM.read(ADDR_BOOT_COUNT);
+  if (bootCount == 0xFF) bootCount = 0;   // treat a blank/erased cell as 0
+  bootCount++;
+  eepromUpdateByte(ADDR_BOOT_COUNT, bootCount);
+
   // Schedule first advertisement at a random offset within the first interval.
   scheduleNextAdvertisement();
 }
@@ -981,6 +1447,10 @@ void setup() {
 // parseState 16 : 'F' prov — serial number hex digits (factory reset by SN)
 // parseState 17 : 'W' prov — serial number ':' full calibration payload (restore by SN)
 // parseState 18 : broadcast 'v' — optional "<lo>-<hi>" ID range for batched query
+// parseState 19 : 'A' prov — serial number hex digits (combined all-fields dump by SN)
+// parseState 20 : 'T' prov — serial number hex digits (Hall self-test by SN)
+// parseState 21 : 'Q' prov — serial number hex digits (diagnostics snapshot by SN)
+// parseState 22 : 'M' prov — serial number hex digits (mechanical self-test by SN)
 
 void loop() {
   wdt_reset();   // service the watchdog every iteration
@@ -989,7 +1459,8 @@ void loop() {
   // Only broadcast version replies are deferred (to stagger across modules).
   // Direct v/d and mXD reply synchronously in the parser.
   if (pendingReply != REPLY_NONE && (long)(millis() - pendingReplyTime) >= 0) {
-    if (pendingReply == REPLY_VERSION) sendVersionResponse();
+    if      (pendingReply == REPLY_VERSION) sendVersionResponse();
+    else if (pendingReply == REPLY_ALL)     dumpAll();
     pendingReply = REPLY_NONE;
   }
 
@@ -1043,6 +1514,14 @@ void loop() {
                                   parseState = 14; }
             else if (c == 'D') { bufClear(snBuf, snLen);
                                   parseState = 15; }
+            else if (c == 'A') { bufClear(snBuf, snLen);
+                                  parseState = 19; }
+            else if (c == 'T') { bufClear(snBuf, snLen);
+                                  parseState = 20; }
+            else if (c == 'Q') { bufClear(snBuf, snLen);
+                                  parseState = 21; }
+            else if (c == 'M') { bufClear(snBuf, snLen);
+                                  parseState = 22; }
             else if (c == 'F') { bufClear(snBuf, snLen);
                                   parseState = 16; }
             else if (c == 'W') { bufClear(snBuf, snLen); snColonSeen = false; restoreLen = 0; restoreBuf[0] = '\0';
@@ -1056,6 +1535,32 @@ void loop() {
               case '+': bufClear(numBuf, numLen); parseState = 12; break;
               case 'h': homeModule(); saveState(); parseState = 0; break;
               case 'c': calibrateModule();          parseState = 0; break;
+              case 'T':
+                // Hall sensor self-test.  Long, motor-driven operation, so it's
+                // direct-addressed only and synchronous (like 'd'/'A'/'c');
+                // broadcast m*T is ignored.
+                if (!idWildcard) {
+                  hallSelfTest();
+                }
+                parseState = 0;
+                break;
+              case 'Q':
+                // Diagnostics snapshot (reset cause, boot count, VCC, EEPROM
+                // health, current index).  Instantaneous read, no movement.
+                // Direct-addressed only; broadcast m*Q is ignored.
+                if (!idWildcard) {
+                  reportDiagnostics();
+                }
+                parseState = 0;
+                break;
+              case 'M':
+                // Mechanical self-test (missed-step / no-motion detection).
+                // Long, motor-driven; direct-addressed only and synchronous.
+                if (!idWildcard) {
+                  mechanicalTest();
+                }
+                parseState = 0;
+                break;
               case 'o': bufClear(numBuf, numLen); parseState = 5; break;
               case 't': bufClear(numBuf, numLen); parseState = 6; break;
               case 's': bufClear(numBuf, numLen); parseState = 7; break;
@@ -1072,6 +1577,25 @@ void loop() {
                 }
                 parseState = 0;
                 break;
+              case 'A':
+                // Combined "all fields" dump (version + EEPROM in one message).
+                if (idWildcard) {
+                  // Broadcast all-fields query — may carry an optional
+                  // "<lo>-<hi>" range.  Collect it in state 18; replies are
+                  // staggered via the deferred path using the wider 'A' slot.
+                  // Because each 'A' frame is long (~570 ms), a full sweep is
+                  // slow — prefer ranged batches (m*A<lo>-<hi>) for big buses.
+                  bufClear(numBuf, numLen);
+                  replyRangeLo = 0;
+                  replyRangeHi = 254;
+                  broadcastReplyType = REPLY_ALL;
+                  parseState = 18;
+                } else {
+                  // Direct query — reply SYNCHRONOUSLY and immediately, like mXD.
+                  dumpAll();
+                  parseState = 0;
+                }
+                break;
               case 'R': resetProvisioning();                              parseState = 0; break;
               case 'v':
                 if (idWildcard) {
@@ -1081,6 +1605,7 @@ void loop() {
                   bufClear(numBuf, numLen);
                   replyRangeLo = 0;
                   replyRangeHi = 254;
+                  broadcastReplyType = REPLY_VERSION;
                   parseState = 18;
                 } else {
                   // Direct query — reply SYNCHRONOUSLY and immediately, like mXD.
@@ -1228,6 +1753,38 @@ void loop() {
         bufClear(snBuf, snLen); parseState = 0;
         break;
 
+      // ── State 19: 'A' combined all-fields dump by serial number ───────
+      // Format:  mXA<serialNumber>\n
+      // Only the matching module replies with the combined 'A' message.
+      case 19:
+        if (c != '\n' && c != '\r') { bufAppend(snBuf, snLen, SNBUF_MAX, c); break; }
+        if (serialMatches(snBuf)) dumpAll();
+        bufClear(snBuf, snLen); parseState = 0;
+        break;
+
+      // ── State 20: 'T' Hall sensor self-test by serial number ──────────
+      // Format:  mXT<serialNumber>\n
+      // Only the matching module runs the test and replies with its status.
+      case 20:
+        if (c != '\n' && c != '\r') { bufAppend(snBuf, snLen, SNBUF_MAX, c); break; }
+        if (serialMatches(snBuf)) hallSelfTest();
+        bufClear(snBuf, snLen); parseState = 0;
+        break;
+
+      // ── State 21: 'Q' diagnostics snapshot by serial number ───────────
+      case 21:
+        if (c != '\n' && c != '\r') { bufAppend(snBuf, snLen, SNBUF_MAX, c); break; }
+        if (serialMatches(snBuf)) reportDiagnostics();
+        bufClear(snBuf, snLen); parseState = 0;
+        break;
+
+      // ── State 22: 'M' mechanical self-test by serial number ───────────
+      case 22:
+        if (c != '\n' && c != '\r') { bufAppend(snBuf, snLen, SNBUF_MAX, c); break; }
+        if (serialMatches(snBuf)) mechanicalTest();
+        bufClear(snBuf, snLen); parseState = 0;
+        break;
+
       // ── State 16: 'F' factory-reset EEPROM by serial number ───────────
       // Format:  mXF<serialNumber>\n
       // Resets all calibration values to defaults; preserves module ID.
@@ -1262,12 +1819,14 @@ void loop() {
         }
         break;
 
-      // ── State 18: optional range for broadcast version query ───────────
-      // Reached after "m*v".  Accepts an optional "<lo>-<hi>" range:
-      //   m*v\n         → whole bus   (replyRangeLo=0,  replyRangeHi=254)
-      //   m*v0-49\n     → IDs 0–49 only
-      //   m*v50-99\n    → IDs 50–99 only
+      // ── State 18: optional range for a broadcast version/all query ─────
+      // Reached after "m*v" or "m*A".  Accepts an optional "<lo>-<hi>" range:
+      //   m*v\n / m*A\n   → whole bus   (replyRangeLo=0,  replyRangeHi=254)
+      //   m*v0-49\n       → IDs 0–49 only
+      //   m*A50-99\n      → IDs 50–99 only
       //
+      // broadcastReplyType (set on entry) selects whether matching modules
+      // reply with a version frame or a combined all-fields dump.
       // numBuf accumulates the low number until '-', then the high number.
       // snColonSeen is reused here as a "seen the dash" flag.
       case 18:
@@ -1288,7 +1847,7 @@ void loop() {
               replyRangeHi = replyRangeLo;
             }
           }
-          schedulePendingReply(REPLY_VERSION, true);
+          schedulePendingReply(broadcastReplyType, true);
           bufClear(numBuf, numLen); snColonSeen = false; parseState = 0;
         }
         break;
@@ -1325,13 +1884,14 @@ void loop() {
 
   // ── Timeout: flush incomplete provisioning frames (200 ms idle) ───────────
   if ((parseState == 13 || parseState == 14 || parseState == 15 ||
-       parseState == 16 || parseState == 17)
+       parseState == 16 || parseState == 17 || parseState == 19 ||
+       parseState == 20 || parseState == 21 || parseState == 22)
       && (millis() - lastSerialTime > 200)) {
     bufClear(snBuf, snLen); snColonSeen = false;
     restoreLen = 0; restoreBuf[0] = '\0'; bufClear(numBuf, numLen); parseState = 0;
   }
 
-  // ── Timeout: finalise a broadcast version-range query (50 ms idle) ────────
+  // ── Timeout: finalise a broadcast version/all range query (50 ms idle) ────
   // If the line had no explicit terminator, schedule the reply with whatever
   // range was parsed so far (defaults already set when entering state 18).
   if (parseState == 18 && (millis() - lastSerialTime > 50)) {
@@ -1341,7 +1901,7 @@ void loop() {
       replyRangeLo = (int)bufToLong(numBuf, numLen);
       replyRangeHi = replyRangeLo;
     }
-    schedulePendingReply(REPLY_VERSION, true);
+    schedulePendingReply(broadcastReplyType, true);
     bufClear(numBuf, numLen); snColonSeen = false; parseState = 0;
   }
 }  // end loop()
