@@ -2,9 +2,6 @@
 
 Firmware for a multi-module split-flap display where each character cell is an independent ATtiny1616 microcontroller connected to a shared RS-485 bus. A Raspberry Pi (or any serial host) sends commands over the bus to drive individual cells or the whole display at once.
 
-It is designed to work with the Split-Flap display from Adam G.  See https://youtu.be/-C8_AtxEEQc?si=Gym5wikeFH2vUNRm
-The protocol is fully backward compatible.
-
 ---
 
 ## Table of Contents
@@ -32,6 +29,7 @@ The protocol is fully backward compatible.
   - [Provisioning a New Module](#provisioning-a-new-module)
   - [De-provisioning Modules](#de-provisioning-modules)
 - [Calibration Workflow](#calibration-workflow)
+- [Diagnostics Workflow](#diagnostics-workflow)
 - [Upgrading Firmware](#upgrading-firmware)
 
 ---
@@ -39,9 +37,9 @@ The protocol is fully backward compatible.
 ## Repository Contents
 
 ```
-splitflapfirmwarev12.ino  — ATtiny1616 firmware (Arduino sketch)
-provision.py              — Raspberry Pi provisioning and management tool
-README.md                 — This file
+SplitFlapUniversalFirmware.ino  — ATtiny1616 firmware (Arduino sketch)
+provision.py                    — Raspberry Pi provisioning and management tool
+README.md                       — This file
 ```
 
 ---
@@ -53,7 +51,8 @@ The firmware is a standard Arduino sketch targeting the ATtiny1616 via the [mega
 1. Install **megaTinyCore** in the Arduino IDE via Boards Manager.
 2. Select **ATtiny1616** as the target board.
 3. Set the programmer to **jtag2updi** (or whichever UPDI programmer you are using).
-4. Open `splitflapfirmwarev12.ino` and click **Upload**.
+4. Set **Tools → Save EEPROM** to **"EEPROM retained"** and run **Burn Bootloader** once per chip. This sets the `EESAVE` fuse so that re-flashing preserves each module's ID and calibration (see [Upgrading Firmware](#upgrading-firmware)).
+5. Open `SplitFlapUniversalFirmware.ino` and click **Upload**.
 
 Every module runs the same firmware binary. IDs are assigned at runtime via the provisioning tool — there is nothing to change before flashing.
 
@@ -77,6 +76,7 @@ Once a numeric bus ID (0–254) is assigned via the provisioning tool, the modul
 ```
 Power on
   │
+  ├─ Capture reset cause (RSTFR) and increment the boot counter
   ├─ Read ATtiny serial number from SIGROW
   ├─ Seed random number generator from serial number
   ├─ Load config from EEPROM
@@ -84,19 +84,22 @@ Power on
   │     Magic = 0x5E (v8/v9 era)  → load all fields, rewrite magic to 0x5D
   │     Anything else (blank chip) → write defaults, module ID = 255
   │
-  ├─ Staggered startup delay
-  │     Provisioned   → delay = moduleId × 150 ms  (deterministic)
-  │     Unprovisioned → delay = random 0–10 s       (spread from serial number)
+  ├─ Staggered startup delay (capped so high IDs are not unresponsive for long)
+  │     Provisioned   → delay = (moduleId mod 32) × 120 ms  (≤ ~3.7 s)
+  │     Unprovisioned → delay = random 0–4 s                (spread from serial number)
   │     (prevents inrush current when many modules power on together)
   │
+  ├─ Enable the 2 s watchdog timer
   └─ Home or restore position
         autoHome = 1 → spin to Hall sensor, advance to flap 0
         autoHome = 0 → restore last saved step position from EEPROM
 ```
 
+A 2-second hardware watchdog runs continuously after boot; if any operation hangs (e.g. a stuck Hall sensor mid-move), the module resets and re-homes itself rather than staying dead until power-cycled.
+
 ### EEPROM Layout
 
-The EEPROM field layout has been identical since v6. Only the magic byte has varied across firmware versions; all known variants are recognised and migrated automatically on upgrade.
+The EEPROM field layout has been compatible since v6. Addresses `0x0A` and `0x0B` were reserved padding in the original layout and were put to use for diagnostics in v26 without disturbing any existing field or the flap map. Only the magic byte has varied across firmware versions; all known variants are recognised and migrated automatically on upgrade.
 
 | Address | Size | Contents |
 |---|---|---|
@@ -107,14 +110,15 @@ The EEPROM field layout has been identical since v6. Only the magic byte has var
 | 0x06 | 1 byte | Auto-home flag (1 = home on boot, 0 = restore saved position) |
 | 0x07 | 2 bytes | Saved step position (used when auto-home is off) |
 | 0x09 | 1 byte | Saved flap index (used when auto-home is off) |
-| 0x0A | 2 bytes | Reserved |
+| 0x0A | 1 byte | Boot counter (diagnostics; wraps at 255) |
+| 0x0B | 1 byte | EEPROM health-check scratch byte (diagnostics) |
 | 0x0C | 128 bytes | Calibrated step positions: 64 × `uint16_t`, `0xFFFF` = uncalibrated |
 
 **Magic byte history** — all values are recognised and migrated to `0x5D` on first boot after upgrade:
 
 | Value | Written by | Action on load |
 |---|---|---|
-| `0x5D` | v6, v12 (current) | Load all fields — already current |
+| `0x5D` | v6 and later (current) | Load all fields — already current |
 | `0x5E` | v8, v9 (erroneous bump) | Load all fields, rewrite magic to `0x5D` |
 | Other | Blank chip | Write all defaults, leave ID as 255 |
 
@@ -144,7 +148,10 @@ The firmware accepts all address formats that have ever been used across all ver
 | Two-digit zero-padded decimal | `m38`, `m05` | Single module — v6 style |
 | Variable-length decimal | `m5`, `m138` | Single module — v7+ style |
 | One or two stars | `m*`, `m**` | Broadcast to all provisioned modules |
+| Star with ID range | `m*v0-49` | Broadcast to a sub-range of IDs (see `v` / `A` below) |
 | Literal `X` | `mX` | Provisioning address — all modules respond regardless of ID |
+
+Broadcast replies are **staggered**: each responding module waits for a time slot indexed by its ID before transmitting, so replies arrive as a clean sequence rather than colliding. The slot width depends on the reply size (see the `v` and `A` commands). Long, motor-driven commands and multi-line replies (`d`, `A`, `c`, `T`, `Q`, `M`) are **direct-addressed only** — they cannot be staggered across a broadcast and ignore the `*` wildcard.
 
 ---
 
@@ -242,7 +249,7 @@ m38o2832\n
 
 #### `s` — Nudge
 
-Advances the reel by `n` additional half-steps from its current position and adds that distance to the stored home offset. Use this for fine-tuning the home position without re-running a full calibration.
+Advances the reel by `n` additional half-steps from its current position and adds that distance to the stored home offset. Use this for fine-tuning the home position without re-running a full calibration. The value may be **negative** (e.g. `m38s-16`); since the reel is mechanically one-way, a negative nudge spins forward by nearly a full revolution to reach the equivalent position, and the stored offset is adjusted (and wrapped) accordingly.
 
 ```
 m<ID>s<steps>\n
@@ -347,7 +354,7 @@ When auto-home is disabled the current step position and flap index are saved to
 
 #### `d` — Dump EEPROM
 
-Returns the module's full configuration in one RS-485 message.
+Returns the module's full calibration configuration in one RS-485 message. **Direct-addressed only** (broadcast `m*d` is ignored — a full dump can be ~600 bytes / ~0.6 s, too long to stagger).
 
 **Response format:**
 ```
@@ -363,20 +370,47 @@ m38d:2832:4096:0=0,7=342,12=683\n
 
 ---
 
-#### `v` — Report firmware version
+#### `A` — Combined "all fields" dump
 
-Returns the firmware version string. Useful for verifying which version is running after an upgrade.
+Returns **everything from `v` and `d` in a single message**, so a client can fetch a module's complete state in one command instead of two. The `v` and `d` commands are unchanged and remain available.
 
 **Response format:**
 ```
-m<ID>v:<version>\n
+m<ID>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<idx>=<pos>,...\n
 ```
 
-**Example:**
+**Example response:**
 ```
-m38v\n        → m38v:12\n
-m*v\n         → every module replies with its own ID and version
+m38A:26:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342\n
 ```
+
+Direct-addressed `m<ID>A` and serial-number `mXA<sn>` forms reply synchronously. The broadcast form `m*A` **is** supported and staggered, with an optional ID range — but because each `A` frame is long (~570 ms), a full sweep is slow; prefer ranged batches on large buses:
+
+```
+m*A\n         → all provisioned modules answer (wide ~700 ms slots)
+m*A0-49\n     → only IDs 0–49 answer
+m*A50-99\n    → only IDs 50–99 answer
+```
+
+---
+
+#### `v` — Report firmware version
+
+Returns the firmware version, module ID, and ATtiny1616 serial number. Useful for verifying which version is running after an upgrade and for cross-referencing a provisioned ID back to a physical serial number.
+
+**Response format:**
+```
+m<ID>v:<version>:<moduleId>:<serialNumber>\n
+```
+
+**Examples:**
+```
+m38v\n        → m38v:26:38:A3F24C0018E7D29B3F01\n
+m*v\n         → every provisioned module replies in sequence, each in its own slot
+m*v0-49\n     → only IDs 0–49 reply (poll the bus in retryable batches)
+```
+
+> On a broadcast `m*v`, each module delays its reply by a fixed lead-in plus `(moduleId − rangeLo) × 100 ms` before asserting the bus, so replies arrive as a clean, collision-free sequence. The optional `<lo>-<hi>` range lets a controller poll a large bus in batches and re-issue only the ranges that come back incomplete — far more reliable at scale than one all-or-nothing sweep. A plain `m*v` is equivalent to `m*v0-254`.
 
 ---
 
@@ -408,6 +442,74 @@ m*F\n         (broadcast)
 | EEPROM magic byte | Next boot loads correctly without re-initialising |
 
 > After an `F` reset the module will need to be re-calibrated. Run `c` (calibrate revolution) followed by `s` (nudge) to re-establish the home position.
+
+---
+
+#### `T` — Hall sensor self-test
+
+Steps the reel through one revolution and reports the health of the Hall home sensor. **Direct-addressed only.** Useful for diagnosing a sensor that is disconnected, wired with reversed polarity, or picking up noise.
+
+**Response format:**
+```
+m<ID>T:<code>:<edges>:<activeSamples>\n
+```
+
+| `code` | Meaning | Likely cause |
+|---|---|---|
+| 0 | OK | One clean home pulse per revolution |
+| 1 | Stuck active | Shorted sensor, magnet jammed at the sensor, or mis-wiring |
+| 2 | Dead / disconnected | No magnet detection at all — dead or unplugged sensor |
+| 3 | Multiple regions | Stray magnet, electrical noise, or a chattering sensor |
+| 4 | Inverted polarity | Sensor reads active everywhere with one brief dip — wired backwards |
+
+`<edges>` is the number of home pulses seen per revolution (a healthy sensor shows 1); `<activeSamples>` is how many sampled steps read active (advisory detail).
+
+---
+
+#### `Q` — Diagnostics snapshot
+
+Returns an instantaneous module health snapshot. **No motor movement**, so it is fast and safe to poll. **Direct-addressed only.**
+
+**Response format:**
+```
+m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
+```
+
+| Field | Meaning |
+|---|---|
+| `resetCause` | Raw reset-flag bits from the last reset: `0x01` power-on, `0x02` brown-out, `0x04` external, `0x08` watchdog, `0x10` software |
+| `bootCount` | Boots since the counter was last cleared (wraps at 255) — a climbing value indicates a module silently resetting in the field |
+| `vcc_mV` | Measured supply voltage in millivolts |
+| `eepromOk` | `1` if the EEPROM write-read-verify check passed, else `0` |
+| `curIndex` | Current flap index (`-1` = position unknown / needs homing) |
+
+**Example response:**
+```
+m38Q:0:2:4980:1:0\n
+```
+
+> Watch for a non-zero watchdog (`0x08`) or brown-out (`0x02`) reset bit, a supply voltage sagging below your design target under load, `eepromOk = 0`, or a `bootCount` that keeps climbing between polls.
+
+---
+
+#### `M` — Mechanical self-test
+
+Drives the motor and measures steps-per-revolution across several rotations to detect missed steps and a non-moving motor. **Direct-addressed only.** Because it physically spins the reel for several revolutions, it takes ~20 seconds.
+
+**Response format:**
+```
+m<ID>M:<code>:<min>:<max>:<spreadTenthsPct>\n
+```
+
+| `code` | Meaning | Likely cause |
+|---|---|---|
+| 0 | OK | All revolutions consistent |
+| 1 | Inconsistent | Spread > 5% — intermittent missed steps (drag, weak supply, failing driver) |
+| 2 | No motion | Motor not turning (open coil, dead driver, jam) **or** a dead Hall sensor |
+
+`<min>` and `<max>` are the smallest and largest steps-per-revolution measured; `<spreadTenthsPct>` is `(max − min) / average` in tenths of a percent (e.g. `23` = 2.3%). A healthy module shows a near-zero spread.
+
+> Because `M` observes motion *through* the Hall sensor, a working motor with a dead sensor also reports code 2. **Run `T` first** to confirm the sensor is healthy, then interpret an `M` result accordingly.
 
 ---
 
@@ -457,6 +559,33 @@ mXack:<serialNumber>:<assignedId>\n
 mXIA3F24C0018E7D29B3F01:38\n
 →  mXackA3F24C0018E7D29B3F01:38\n
 ```
+
+---
+
+#### Serial-number variants of other commands
+
+Several commands have an `mX<letter><serialNumber>` form that targets a single module by its serial number rather than its bus ID. Only the module whose serial matches responds; all others discard the command. These are useful before a module has been assigned an ID, or to address a specific module when its ID is unknown.
+
+| Command | Action | Reply |
+|---|---|---|
+| `mXD<sn>` | Dump EEPROM config by serial number | Same as `d` |
+| `mXA<sn>` | Combined all-fields dump by serial number | Same as `A` |
+| `mXF<sn>` | Factory-reset EEPROM by serial number (preserves module ID) | None |
+| `mXW<sn>:<homeOffset>:<totalSteps>:<idx>=<pos>,...` | Restore a previously dumped EEPROM image (preserves module ID; map entries absent from the payload are cleared) | None |
+| `mXT<sn>` | Hall sensor self-test by serial number | Same as `T` |
+| `mXQ<sn>` | Diagnostics snapshot by serial number | Same as `Q` |
+| `mXM<sn>` | Mechanical self-test by serial number | Same as `M` |
+
+**Backup-and-restore example** — capture a module's calibration and push it back (e.g. after replacing a board):
+
+```
+mXDA3F24C0018E7D29B3F01\n
+→  m38d:2832:4096:0=0,7=342,12=683\n
+
+mXWA3F24C0018E7D29B3F01:2832:4096:0=0,7=342,12=683\n
+```
+
+The `mXW` payload format is identical to what `d` / `mXD` emit (minus the `m<id>d:` prefix), so a dumped configuration can be replayed directly.
 
 ---
 
@@ -642,22 +771,50 @@ Follow these steps when setting up a module for the first time or after a mechan
    m38d\n            → dump EEPROM config including all saved flap positions
    ```
 
-8. **Confirm firmware version:**
+8. **Confirm firmware version and check hardware health:**
    ```
-   m38v\n            → m38v:12\n
+   m38v\n            → m38v:26:38:A3F24C0018E7D29B3F01\n
+   m38T\n            → Hall sensor self-test (expect code 0)
+   m38M\n            → mechanical self-test (expect code 0, near-zero spread)
+   m38Q\n            → diagnostics snapshot (check supply voltage, reset cause)
    ```
+
+   Alternatively, `m38A\n` returns the version, ID, serial number, and full calibration in a single message.
+
+---
+
+## Diagnostics Workflow
+
+When a module misbehaves, work through the self-tests in this order. Each isolates a different subsystem, and the order matters because later tests depend on earlier ones being healthy.
+
+1. **`m<id>Q`** — instantaneous snapshot, no movement. Check first:
+   - Is the **supply voltage** at your design target? A sagging rail (e.g. 3.3 V on a 5 V system) under-powers the stepper and causes missed steps or stalls — fix this before chasing motor/sensor faults.
+   - Is the **reset cause** a watchdog (`0x08`) or brown-out (`0x02`)? Is **bootCount** climbing? Either indicates the module is resetting unexpectedly.
+   - Did the **EEPROM check** pass (`eepromOk = 1`)?
+
+2. **`m<id>T`** — Hall sensor self-test. The sensor must be healthy before the mechanical test can be trusted, because `M` observes motion through it.
+   - Code 0 → sensor good, proceed.
+   - Code 2 → dead/disconnected; code 4 → wired with reversed polarity; code 3 → noise or a stray magnet.
+
+3. **`m<id>M`** — mechanical self-test, only meaningful once `T` reports code 0.
+   - Code 0 with near-zero spread → motor healthy.
+   - Code 1 → intermittent missed steps (check supply under load, mechanical drag, the driver).
+   - Code 2 (with a healthy `T`) → motor not turning: open coil, dead ULN2003 channel, or a physical jam.
+
+> A wild `M` result (e.g. a huge spread, or a "revolution" measured as far fewer steps than expected) usually means the **Hall sensor is reporting false detections** rather than the motor failing — confirm with `T` before replacing a motor or driver.
 
 ---
 
 ## Upgrading Firmware
 
-All firmware versions from v6 onward use the same EEPROM field layout. Flashing any newer firmware version onto an existing module will not erase calibration data or the module ID.
+All firmware versions from v6 onward use the same EEPROM field layout. Flashing a newer firmware version onto an existing module will not erase calibration data or the module ID — **provided the `EESAVE` fuse is set** so that the chip erase performed before each UPDI flash preserves EEPROM.
 
-| Previous version | Magic byte on chip | Behaviour on first v12 boot |
+In the Arduino IDE with megaTinyCore: set **Tools → Save EEPROM** to **"EEPROM retained"** and run **Burn Bootloader** once per chip (a plain Upload does not write fuses). After that, every Upload preserves the module's ID and calibration. If this fuse is *not* set, each flash wipes EEPROM and the module reverts to unprovisioned with default calibration.
+
+| Previous version | Magic byte on chip | Behaviour on first boot of new firmware |
 |---|---|---|
-| v6 | `0x5D` | Loaded as-is — no migration needed |
+| v6 or later | `0x5D` | Loaded as-is — no migration needed |
 | v8 or v9 | `0x5E` | Fields loaded, magic rewritten to `0x5D` |
 | Blank chip | `0xFF` | Full default init, ID set to 255 |
 
-> If a module ends up in an unexpected state after flashing, send `m<id>v\n` to confirm the firmware version and `m<id>d\n` to inspect its EEPROM. Use `m<id>F\n` to reset calibration to defaults while keeping the ID, or `m<id>R\n` to fully de-provision the module.
-
+> If a module ends up in an unexpected state after flashing, send `m<id>v\n` to confirm the firmware version and `m<id>d\n` (or `m<id>A\n` for everything at once) to inspect its EEPROM. Use `m<id>F\n` to reset calibration to defaults while keeping the ID, or `m<id>R\n` to fully de-provision the module. As a recovery path, keep periodic `mXD` dumps of each module so calibration can be restored with `mXW` if a chip is ever wiped or replaced.
