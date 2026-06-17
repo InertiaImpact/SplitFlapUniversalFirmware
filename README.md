@@ -381,7 +381,7 @@ m<ID>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:
 
 **Example response:**
 ```
-m38A:26:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342\n
+m38A:29:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342\n
 ```
 
 Direct-addressed `m<ID>A` and serial-number `mXA<sn>` forms reply synchronously. The broadcast form `m*A` **is** supported and staggered, with an optional ID range — but because each `A` frame is long (~570 ms), a full sweep is slow; prefer ranged batches on large buses:
@@ -405,7 +405,7 @@ m<ID>v:<version>:<moduleId>:<serialNumber>\n
 
 **Examples:**
 ```
-m38v\n        → m38v:26:38:A3F24C0018E7D29B3F01\n
+m38v\n        → m38v:29:38:A3F24C0018E7D29B3F01\n
 m*v\n         → every provisioned module replies in sequence, each in its own slot
 m*v0-49\n     → only IDs 0–49 reply (poll the bus in retryable batches)
 ```
@@ -451,7 +451,7 @@ Steps the reel through one revolution and reports the health of the Hall home se
 
 **Response format:**
 ```
-m<ID>T:<code>:<edges>:<activeSamples>\n
+m<ID>T:<code>:<edges>:<activeSamples>:<fallingEdges>\n
 ```
 
 | `code` | Meaning | Likely cause |
@@ -462,7 +462,7 @@ m<ID>T:<code>:<edges>:<activeSamples>\n
 | 3 | Multiple regions | Stray magnet, electrical noise, or a chattering sensor |
 | 4 | Inverted polarity | Sensor reads active everywhere with one brief dip — wired backwards |
 
-`<edges>` is the number of home pulses seen per revolution (a healthy sensor shows 1); `<activeSamples>` is how many sampled steps read active (advisory detail).
+`<edges>` (rising edges) is the number of home pulses seen per revolution (a healthy sensor shows 1); `<activeSamples>` is how many sampled steps read active (advisory detail). `<fallingEdges>` (appended in v28) counts active→inactive transitions; a clean sensor shows `edges == fallingEdges == 1`. A mismatch indicates the active region straddles the revolution boundary or the sensor releases raggedly. An older parser ignores this trailing field.
 
 ---
 
@@ -494,11 +494,18 @@ m38Q:0:2:4980:1:0\n
 
 #### `M` — Mechanical self-test
 
-Drives the motor and measures steps-per-revolution across several rotations to detect missed steps and a non-moving motor. **Direct-addressed only.** Because it physically spins the reel for several revolutions, it takes ~20 seconds.
+Drives the motor and measures steps-per-revolution across several rotations to detect missed steps and a non-moving motor. **Direct-addressed only.** Because it physically spins the reel for several revolutions, it takes ~20 seconds at the default count.
+
+Accepts an **optional revolution count**: bare `m<id>M` samples the default number of rotations, while `m<id>M<n>` requests `n` rotations for better statistics on rare intermittent faults. `n` is clamped to a safe range (5–20 by default); values below the minimum or above the maximum are pulled into range. More rotations catch rarer faults but take proportionally longer (~4 s each). The serial-number form (`mXM<sn>`) does not take a count and always uses the default.
+
+```
+m38M\n        → mechanical test, default rotation count
+m38M20\n      → mechanical test, 20 rotations (more thorough)
+```
 
 **Response format:**
 ```
-m<ID>M:<code>:<min>:<max>:<spreadTenthsPct>\n
+m<ID>M:<code>:<min>:<max>:<spreadTenthsPct>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
 ```
 
 | `code` | Meaning | Likely cause |
@@ -507,7 +514,31 @@ m<ID>M:<code>:<min>:<max>:<spreadTenthsPct>\n
 | 1 | Inconsistent | Spread > 5% — intermittent missed steps (drag, weak supply, failing driver) |
 | 2 | No motion | Motor not turning (open coil, dead driver, jam) **or** a dead Hall sensor |
 
-`<min>` and `<max>` are the smallest and largest steps-per-revolution measured; `<spreadTenthsPct>` is `(max − min) / average` in tenths of a percent (e.g. `23` = 2.3%). A healthy module shows a near-zero spread.
+Every field has the same meaning regardless of result code (the parser never has to branch on `code`):
+
+| Field | Meaning |
+|---|---|
+| `min` / `max` | Smallest / largest steps-per-revolution measured (both `0` on a no-motion result) |
+| `spreadTenthsPct` | `(max − min) / average` in tenths of a percent (e.g. `23` = 2.3%); `0` on a no-motion result. A healthy module shows a near-zero spread. |
+| `gateActive` | Hall active-samples seen while driving the ~1.1-revolution motion-detect gate |
+| `gateSpan` | Total steps driven during that gate |
+| `avgMagnetWidth` | Average width (in steps) of the magnet's active region across the measured revolutions |
+| `r1,…,rN` | Raw steps-per-revolution for each of `MECH_TEST_REVS` rotations, comma-separated (empty on a no-motion result) |
+
+> **Compatibility:** `avgMagnetWidth` and the raw rotation list were appended in v28. They come *after* `gateSpan`, so a parser written for the earlier format keeps working unchanged — it simply ignores the trailing fields. A parser that wants the new data should split the rotation list on commas rather than assume a fixed count (it follows `MECH_TEST_REVS`).
+
+**Why the raw rotation list matters:** `min`/`max`/`spread` summarise *how much* the revolutions varied but not *how*. The raw sequence reveals the shape:
+
+- `4096, 4095, 4097, 4096, 3700` — one outlier among healthy revs → an **intermittent** glitch (a single snag), motor basically fine.
+- `4096, 4030, 3960, 3890, 3820` — a steady decline → a **progressive** fault (heating/torque loss, loosening coupler), a failure in progress.
+
+Both produce a similar `spread`, but they are very different diagnoses — only the per-rotation trend tells them apart. `avgMagnetWidth` adds an independent signal: if it drifts from the `T` test's `activeSamples`, or the reel passes on step count while the width wanders, the **sensor-to-magnet gap is changing** as the reel turns (shaft wobble, a loosening magnet).
+
+The `gateActive` / `gateSpan` fields make a **code 2** result directly diagnosable without further probing:
+
+- `gateActive` ≈ one magnet width (e.g. ~168) → the sensor worked but the reel **did not complete a sensed revolution** — motor slip / under-rotation.
+- `gateActive` ≈ 0 → the sensor **never went active** — dead/disconnected sensor, or the magnet never reached it.
+- `gateActive` ≈ `gateSpan` → the sensor **stayed active the whole time** — parked on the magnet or stuck active.
 
 > Because `M` observes motion *through* the Hall sensor, a working motor with a dead sensor also reports code 2. **Run `T` first** to confirm the sensor is healthy, then interpret an `M` result accordingly.
 
@@ -773,7 +804,7 @@ Follow these steps when setting up a module for the first time or after a mechan
 
 8. **Confirm firmware version and check hardware health:**
    ```
-   m38v\n            → m38v:26:38:A3F24C0018E7D29B3F01\n
+   m38v\n            → m38v:29:38:A3F24C0018E7D29B3F01\n
    m38T\n            → Hall sensor self-test (expect code 0)
    m38M\n            → mechanical self-test (expect code 0, near-zero spread)
    m38Q\n            → diagnostics snapshot (check supply voltage, reset cause)
@@ -801,7 +832,7 @@ When a module misbehaves, work through the self-tests in this order. Each isolat
    - Code 1 → intermittent missed steps (check supply under load, mechanical drag, the driver).
    - Code 2 (with a healthy `T`) → motor not turning: open coil, dead ULN2003 channel, or a physical jam.
 
-> A wild `M` result (e.g. a huge spread, or a "revolution" measured as far fewer steps than expected) usually means the **Hall sensor is reporting false detections** rather than the motor failing — confirm with `T` before replacing a motor or driver.
+> A wild `M` result (a huge spread, or a "revolution" measured as far fewer steps than expected) usually means the **Hall sensor is reporting false detections** rather than the motor failing — confirm with `T` before replacing a motor or driver. On a **code 2** specifically, read the `gateActive` field: a value near one magnet width (~150–200) means the reel under-rotated (motor slip) despite a working sensor; near 0 means the sensor never fired; near `gateSpan` means it was parked on the magnet.
 
 ---
 

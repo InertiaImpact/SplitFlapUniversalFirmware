@@ -1,5 +1,5 @@
 // ==============================================================================
-// Split-Flap Universal Firmware — v26
+// Split-Flap Universal Firmware — v29
 // ==============================================================================
 // Each module controls one character cell driven by a 28BYJ-48 stepper motor.
 // A Hall effect sensor detects a magnet on the reel to find the home position.
@@ -50,11 +50,26 @@
 //            0x02 brown-out, 0x04 external, 0x08 watchdog, 0x10 software);
 //            bootCount = boots since counter reset (wraps 255); vcc_mV =
 //            supply millivolts; eepromOk = 1 if EEPROM verify passed.
-//  M         Mechanical self-test (DIRECT-ADDRESSED ONLY, drives the motor):
-//              m<id>M:<code>:<measured1>:<measured2>\n
-//            code 0=OK (two rev measurements agree), 1=inconsistent (>5% apart,
-//            i.e. missed steps — drag, weak supply, failing driver), 2=no motion
-//            (motor not turning — open coil, dead driver channel, jam).
+//  M[<n>]    Mechanical self-test (DIRECT-ADDRESSED ONLY, drives the motor):
+//              m<id>M:<code>:<min>:<max>:<spreadTenthsPct>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
+//            Samples several revolutions and compares them.  Bare 'm<id>M' uses
+//            the default count (MECH_TEST_REVS); 'm<id>M<n>' requests n rotations,
+//            clamped to [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX] (more rotations
+//            catch rarer intermittent faults but take longer, ~4 s each).
+//            code 0=OK (all revs consistent), 1=inconsistent (spread >5%, i.e.
+//            intermittent missed steps — drag, weak supply, failing driver),
+//            2=no motion (motor not turning — open coil/dead driver/jam, OR a
+//            dead Hall sensor: run 'T' first to disambiguate).
+//            min/max = smallest/largest steps-per-rev measured (0 if no motion);
+//            spreadTenthsPct = (max-min)/avg in tenths of a percent (e.g. 23 =
+//            2.3%).  gateActive/gateSpan always report what the motion-detect
+//            gate observed: gateActive = Hall active-samples seen while driving
+//            ~1.1 revolutions (gateSpan).  On a code-2, gateActive ≈ one magnet
+//            width means the reel under-rotated (motor slip); ≈0 means the
+//            sensor never fired; ≈gateSpan means it was parked on the magnet.
+//            avgMagnetWidth = average magnet width across the revs; r1..rN = the
+//            raw steps-per-rev for each rotation (the trend distinguishes an
+//            intermittent glitch from a progressive drift).
 //  o<n>      Set home offset (steps past Hall trigger to flap 0)
 //  t<n>      Set total steps per revolution
 //  s<n>      Nudge forward n steps and add to home offset
@@ -136,6 +151,29 @@
 // ==============================================================================
 // CHANGE LOG
 // ==============================================================================
+//   v29 — Mechanical self-test accepts an optional revolution count: 'm<id>M<n>'
+//         samples n rotations (clamped to [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX]
+//         = 5..20) for better statistics on rare intermittent faults; bare
+//         'm<id>M' still uses the default.  Direct ID form only; the mXM<sn>
+//         serial form always uses the default count.  Backward compatible.
+//   v28 — Richer self-test telemetry (all APPEND-ONLY; existing fields and their
+//         positions are unchanged, so older parsers keep working):
+//           'M' now appends the average magnet width and the raw steps-per-rev
+//               for every sampled rotation:
+//                 ...:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
+//               The per-rotation trend distinguishes an intermittent glitch from
+//               a progressive drift (which min/max/spread report identically),
+//               and a wandering magnet width flags a changing sensor-magnet gap.
+//           'T' now appends fallingEdges (active→inactive transitions); a clean
+//               sensor shows rising == falling == 1.
+//   v27 — Mechanical self-test ('M') now always reports the motion-detect gate
+//         observations as two additional fixed fields:
+//           m<id>M:<code>:<min>:<max>:<spreadTenthsPct>:<gateActive>:<gateSpan>\n
+//         Every field has the same meaning regardless of result code (no more
+//         code-dependent field reuse), so the controller parser never has to
+//         branch.  gateActive/gateSpan make a code-2 NO_MOTION result directly
+//         diagnosable: ~one magnet width = reel under-rotated (motor slip), ~0 =
+//         sensor never fired, ~gateSpan = parked on the magnet.
 //   v26 — Module hardware self-diagnostics (no protocol changes to existing
 //         commands).  All new commands have a direct m<id>X form and an
 //         mX<sn> serial-number form.
@@ -152,9 +190,12 @@
 //               reference), EEPROM write-verify, and current flap index:
 //                 m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
 //           'M' mechanical self-test — drives the motor and measures steps per
-//               revolution twice to detect missed steps (>5% disagreement) and
-//               a non-moving motor (Hall never changes → open coil/dead driver):
-//                 m<id>M:<code>:<measured1>:<measured2>\n
+//               revolution across several rotations (MECH_TEST_REVS) to detect
+//               intermittent missed steps via the spread between revolutions,
+//               and a non-moving motor (over a full revolution the Hall sensor
+//               must see the magnet enter and leave; if it stays in one state
+//               the reel isn't turning → open coil/dead driver/jam):
+//                 m<id>M:<code>:<min>:<max>:<spreadTenthsPct>\n
 //         Reset cause is captured and cleared at boot; the boot counter and an
 //         EEPROM-health scratch byte use addresses 10/11 (previously reserved
 //         padding — no change to any existing field or the flap map).
@@ -217,7 +258,7 @@ enum PendingReply { REPLY_NONE, REPLY_VERSION, REPLY_ALL };
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 // Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
-const char FIRMWARE_VERSION[] = "26";
+const char FIRMWARE_VERSION[] = "29";
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 // RS-485 transceiver
@@ -262,6 +303,17 @@ const unsigned long CSMA_LISTEN_MS = 20UL;
 // motor moves call wdt_reset() internally, so this only needs to cover a normal
 // loop iteration with margin.
 #define WDT_TIMEOUT WDTO_2S
+
+// ── Mechanical self-test ('M') ────────────────────────────────────────────────
+// Number of revolutions sampled to assess steps-per-rev consistency.  More revs
+// give a better estimate of intermittent missed steps but take longer (each rev
+// is ~4 s at the default step delay).  MECH_TEST_REVS is the default used by a
+// bare 'm<id>M'; a request may override it with 'm<id>M<n>', clamped to
+// [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX].  The MAX also sizes the per-rotation
+// result buffer, so raising it costs a little SRAM (one long per rotation).
+#define MECH_TEST_REVS     5
+#define MECH_TEST_REVS_MIN 5
+#define MECH_TEST_REVS_MAX 20
 // ==============================================================================
 // ████  END USER CONFIGURATION  ████████████████████████████████████████████████
 // ==============================================================================
@@ -314,7 +366,7 @@ const int ADDR_SAVED_INDEX = 9;
 // diagnostics WITHOUT disturbing any existing field or the map start:
 const int ADDR_BOOT_COUNT  = 10;  // 1 byte, wraps at 255 — boots since last reset to 0
 const int ADDR_EE_SCRATCH  = 11;  // 1 byte, used by the EEPROM write-read-verify health check
-const int ADDR_MAP_START   = 12;
+const int ADDR_MAP_START   = 12;  // 128 bytes: 64 × uint16_t flap positions (runs to addr 139)
 
 // The one valid magic value for the current layout (same as v6).
 // 0x5E (written by v8/v9) is treated as equivalent during migration.
@@ -699,7 +751,7 @@ void dumpEeprom() {
 //   <idx>=<pos>,... calibrated flap map (only populated entries; from 'd')
 //
 // Example (full map omitted for brevity):
-//   m38A:23:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342\n
+//   m38A:30:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342\n
 //
 // Like dumpEeprom(), the whole line is assembled into a fixed buffer with all
 // EEPROM reads done BEFORE the driver is enabled, then sent as one tight burst.
@@ -1141,7 +1193,11 @@ void hallSelfTest() {
     code = 0;  // OK — exactly one active region of sane width
   }
 
-  // ── Transmit: m<id>T:<code>:<risingEdges>:<activeSamples>\n ──────────
+  // ── Transmit: m<id>T:<code>:<risingEdges>:<activeSamples>:<fallingEdges>\n ──
+  // fallingEdges (appended in v28) is opt-in detail: a clean sensor shows
+  // risingEdges == fallingEdges == 1.  A mismatch (e.g. 1 rising, 0 falling)
+  // indicates the active region straddles the revolution boundary or the sensor
+  // releases raggedly.  Old parsers ignore the trailing field.
   digitalWrite(RS485_DE, HIGH);
   delayMicroseconds(200);
   rs485.print("m");
@@ -1152,6 +1208,8 @@ void hallSelfTest() {
   rs485.print(risingEdges);
   rs485.print(":");
   rs485.print(activeSamples);
+  rs485.print(":");
+  rs485.print(fallingEdges);
   rs485.print("\n");
   delay(2);
   digitalWrite(RS485_DE, LOW);
@@ -1208,19 +1266,33 @@ void reportDiagnostics() {
 // Active test that drives the motor to detect missed steps (mechanical drag,
 // slipping coupler, weak supply, failing driver) and a non-moving motor (open
 // coil / dead driver channel).  Reports:
-//   m<id>M:<code>:<measured1>:<measured2>\n
-//     code 0 = OK            two revolution measurements agree closely
-//          1 = INCONSISTENT  the two measurements differ by >5% → missed steps
-//          2 = NO_MOTION     the Hall reading never changed while driving →
-//                            motor isn't turning (open coil, dead driver, jam)
-//     measured1, measured2 = the two measured steps-per-revolution counts
+//   m<id>M:<code>:<min>:<max>:<spreadTenthsPct>\n
+//     code 0 = OK            all revolutions agree within tolerance
+//          1 = INCONSISTENT  spread between revolutions exceeds tolerance →
+//                            intermittent missed steps (drag, weak supply,
+//                            failing driver)
+//          2 = NO_MOTION     the Hall sensor never transitioned over a full
+//                            revolution → motor isn't turning (open coil, dead
+//                            driver, jam) OR the Hall sensor is dead (run 'T')
+//     min, max          = smallest / largest steps-per-revolution measured
+//                         across MECH_TEST_REVS revolutions
+//     spreadTenthsPct   = (max-min)/average as a percentage × 10 (one decimal),
+//                         e.g. 23 means 2.3% spread.  This is the consistency
+//                         metric: small = repeatable, large = dropping steps.
 //
-// Method: home, then measure steps-from-edge-to-edge twice.  A healthy module
-// returns two nearly-identical counts.  Significant disagreement means steps
-// are being lost; no Hall transition at all means the motor never moved.
+// Method: home, then measure steps-per-revolution MECH_TEST_REVS times in a row
+// and compare.  A healthy module returns nearly-identical counts every rev (a
+// small spread); intermittent missed steps show up as a larger spread that two
+// samples alone might miss.
 //
 // Returns the module re-homed afterward.
-static long measureOneRev() {
+
+// Measures one full revolution (return value = steps per rev).  Also reports the
+// width of the magnet's active region via the out-parameter magnetWidth, which
+// the mechanical test averages — a per-revolution sensor-gap signal that no
+// single-shot measurement can reveal (a wobbling shaft or loosening magnet makes
+// this vary across revolutions).  Pass nullptr if the width isn't needed.
+static long measureOneRev(long *magnetWidth = nullptr) {
   // From somewhere off the magnet, step until the magnet edge, counting steps
   // for one full revolution back to the next edge.  Bounded for safety.
   long safety = 0;
@@ -1229,9 +1301,10 @@ static long measureOneRev() {
   // advance to the first edge
   safety = 0;
   while (!hallActive() && safety < (totalStepsPerRev + 500)) { stepBackward(1); safety++; }
-  // step through the magnet region
-  safety = 0;
-  while (hallActive() && safety < 2000) { stepBackward(1); safety++; }
+  // step through the magnet region — this loop count IS the magnet's active width
+  long width = 0;
+  while (hallActive() && width < 2000) { stepBackward(1); width++; }
+  if (magnetWidth) *magnetWidth = width;
   // count a full revolution until we return through the magnet
   long count = 0;
   while (!hallActive() && count < (totalStepsPerRev * 2 + 1000)) { stepBackward(1); count++; }
@@ -1240,30 +1313,99 @@ static long measureOneRev() {
   return count;
 }
 
-void mechanicalTest() {
-  // Detect "no motion": sample the Hall line across a commanded move and see if
-  // it ever changes.  If the motor is energised but not turning, the sensor
-  // reading is constant.
-  bool startState = hallActive();
-  bool changed = false;
-  for (int i = 0; i < totalStepsPerRev / 4; i++) {  // quarter rev is plenty
+void mechanicalTest(int requestedRevs) {
+  // Clamp the requested rotation count to the configured bounds.  A bare
+  // 'm<id>M' passes MECH_TEST_REVS (the default); 'm<id>M<n>' passes n.
+  int nReq = requestedRevs;
+  if (nReq < MECH_TEST_REVS_MIN) nReq = MECH_TEST_REVS_MIN;
+  if (nReq > MECH_TEST_REVS_MAX) nReq = MECH_TEST_REVS_MAX;
+
+  // Detect "no motion" by driving a FULL revolution and checking that the Hall
+  // sensor sees the magnet enter and leave.  A quarter-rev check is unreliable:
+  // the home magnet is active for only a narrow window, so if the reel starts
+  // with the magnet far from the sensor, the motor can turn correctly yet the
+  // sensor never changes within a quarter turn — a false NO_MOTION.
+  //
+  // NOTE: this test observes motion THROUGH the Hall sensor, so a working motor
+  // with a DEAD sensor also reports NO_MOTION.  Run the 'T' Hall self-test first
+  // to confirm the sensor is healthy, then interpret an M code 2 accordingly.
+  // Count active samples across the gate sweep too, so a NO_MOTION result can
+  // report WHAT it observed rather than just 0:0.  This distinguishes "sensor
+  // never went active" (under-rotation / motor slip / wrong magnet) from
+  // "sensor never went inactive" (parked on magnet, stuck active).
+  long gateActive = 0;
+  bool startState  = hallActive();
+  bool sawActive   = startState;
+  bool sawInactive = !startState;
+  if (startState) gateActive++;
+  long gateSpan = (long)totalStepsPerRev + (totalStepsPerRev / 10);
+  for (long i = 0; i < gateSpan; i++) {
     stepBackward(1);
-    if (hallActive() != startState) { changed = true; break; }
+    if (hallActive()) { sawActive = true; gateActive++; }
+    else                sawInactive = true;
   }
+  bool moved = sawActive && sawInactive;
 
   uint8_t code;
-  long m1 = 0, m2 = 0;
-  if (!changed) {
-    code = 2;  // NO_MOTION — sensor never changed while driving
+  long mn = 0, mx = 0;              // min/max steps-per-rev (0 when no motion)
+  long spreadTenthsPct = 0;
+  long revs[MECH_TEST_REVS_MAX];   // per-rotation step counts (sized to the max)
+  int  nRevs = 0;                  // how many rotation values are valid
+  long avgMagnetWidth = 0;         // average active-region width across the revs
+
+  for (int r = 0; r < nReq; r++) revs[r] = 0;
+
+  if (!moved) {
+    code = 2;  // NO_MOTION — gate never saw both Hall states over a full rev
+    // mn/mx/spread/revs stay 0; the gate fields below carry the diagnostic detail.
   } else {
-    m1 = measureOneRev();
-    m2 = measureOneRev();
-    long diff = m1 > m2 ? (m1 - m2) : (m2 - m1);
-    long tol  = (m1 > m2 ? m1 : m2) / 20;   // 5% tolerance
-    code = (diff <= tol) ? 0 : 1;           // 0 OK, 1 INCONSISTENT
+    // Sample the requested number of revolutions: track min, max, sum (for the
+    // average step count), each raw rotation value, and the magnet width per rev.
+    long sum = 0;
+    long widthSum = 0;
+    for (int r = 0; r < nReq; r++) {
+      long width = 0;
+      long m = measureOneRev(&width);
+      revs[r] = m;
+      widthSum += width;
+      if (r == 0) { mn = mx = m; }
+      else {
+        if (m < mn) mn = m;
+        if (m > mx) mx = m;
+      }
+      sum += m;
+    }
+    nRevs = nReq;
+    long avg = sum / nReq;
+    avgMagnetWidth = widthSum / nReq;
+
+    // Spread as tenths of a percent of the average: (max-min)/avg × 1000.
+    // Integer math, avg is always well above zero for a turning motor.
+    spreadTenthsPct = (avg > 0) ? ((mx - mn) * 1000L) / avg : 0;
+
+    // Tolerance: 5.0% spread (= 50 tenths) is the pass/fail line.
+    code = (spreadTenthsPct <= 50) ? 0 : 1;   // 0 OK, 1 INCONSISTENT
   }
   releaseMotor();
 
+  // Reply format (all original fields unchanged; new fields APPENDED so existing
+  // parsers keep working — they simply ignore anything past gateSpan):
+  //   m<id>M:<code>:<min>:<max>:<spread>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
+  //     code            0 OK, 1 inconsistent, 2 no motion
+  //     min,max         smallest/largest steps-per-rev measured (0 if no motion)
+  //     spread          (max-min)/avg in tenths of a percent (0 if no motion)
+  //     gateActive      Hall active-sample count during the one-rev motion gate
+  //     gateSpan        total steps driven during the gate (~1.1 revolutions)
+  //   --- appended in v28 (opt-in; old parsers ignore) -------------------------
+  //     avgMagnetWidth  average magnet active-region width across the revs.  A
+  //                     value that drifts from the 'T' test's width, or that the
+  //                     per-rev raw list shows varying, points to a changing
+  //                     sensor-magnet gap (shaft wobble, loosening magnet).
+  //     r1..rN          the raw steps-per-rev for each of MECH_TEST_REVS rotations,
+  //                     comma-separated.  The TREND across these distinguishes an
+  //                     intermittent single glitch from a progressive drift that
+  //                     min/max/spread alone cannot.  Empty on a no-motion result.
+  //                     Parsers should split on ',' rather than assume a count.
   digitalWrite(RS485_DE, HIGH);
   delayMicroseconds(200);
   rs485.print("m");
@@ -1271,9 +1413,22 @@ void mechanicalTest() {
   rs485.print("M:");
   rs485.print(code);
   rs485.print(":");
-  rs485.print(m1);
+  rs485.print(mn);
   rs485.print(":");
-  rs485.print(m2);
+  rs485.print(mx);
+  rs485.print(":");
+  rs485.print(spreadTenthsPct);
+  rs485.print(":");
+  rs485.print(gateActive);
+  rs485.print(":");
+  rs485.print(gateSpan);
+  rs485.print(":");
+  rs485.print(avgMagnetWidth);
+  rs485.print(":");
+  for (int r = 0; r < nRevs; r++) {
+    if (r > 0) rs485.print(",");
+    rs485.print(revs[r]);
+  }
   rs485.print("\n");
   delay(2);
   digitalWrite(RS485_DE, LOW);
@@ -1451,6 +1606,7 @@ void setup() {
 // parseState 20 : 'T' prov — serial number hex digits (Hall self-test by SN)
 // parseState 21 : 'Q' prov — serial number hex digits (diagnostics snapshot by SN)
 // parseState 22 : 'M' prov — serial number hex digits (mechanical self-test by SN)
+// parseState 23 : direct 'M' — optional revolution-count digits (m<id>M<n>)
 
 void loop() {
   wdt_reset();   // service the watchdog every iteration
@@ -1556,10 +1712,15 @@ void loop() {
               case 'M':
                 // Mechanical self-test (missed-step / no-motion detection).
                 // Long, motor-driven; direct-addressed only and synchronous.
+                // Accepts an OPTIONAL revolution count: m<id>M<n> (n clamped to
+                // [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX]); bare m<id>M uses the
+                // default.  Collect any digits in state 23, then run on terminator.
                 if (!idWildcard) {
-                  mechanicalTest();
+                  bufClear(numBuf, numLen);
+                  parseState = 23;
+                } else {
+                  parseState = 0;
                 }
-                parseState = 0;
                 break;
               case 'o': bufClear(numBuf, numLen); parseState = 5; break;
               case 't': bufClear(numBuf, numLen); parseState = 6; break;
@@ -1779,10 +1940,24 @@ void loop() {
         break;
 
       // ── State 22: 'M' mechanical self-test by serial number ───────────
+      // The SN form does not take a count parameter; it always uses the default.
       case 22:
         if (c != '\n' && c != '\r') { bufAppend(snBuf, snLen, SNBUF_MAX, c); break; }
-        if (serialMatches(snBuf)) mechanicalTest();
+        if (serialMatches(snBuf)) mechanicalTest(MECH_TEST_REVS);
         bufClear(snBuf, snLen); parseState = 0;
+        break;
+
+      // ── State 23: optional revolution count for direct 'M' ────────────
+      // Reached after a direct (non-broadcast) 'm<id>M'.  Collects optional
+      // digits: bare 'm<id>M' → default count; 'm<id>M<n>' → n (clamped inside
+      // mechanicalTest to [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX]).
+      case 23:
+        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+        // Terminator (\n, \r, or anything else): run with the parsed count, or
+        // the default if no digits were supplied.
+        mechanicalTest(numLen > 0 ? (int)bufToLong(numBuf, numLen) : MECH_TEST_REVS);
+        bufClear(numBuf, numLen);
+        parseState = 0;
         break;
 
       // ── State 16: 'F' factory-reset EEPROM by serial number ───────────
@@ -1878,6 +2053,16 @@ void loop() {
         case 12: moveToIndex((int)bufToLong(numBuf, numLen)); break;
       }
     }
+    bufClear(numBuf, numLen);
+    parseState = 0;
+  }
+
+  // ── Timeout: run a direct 'M' that arrived without a terminator (50 ms) ───
+  // State 23 collects an optional revolution count after 'm<id>M'.  If the line
+  // idles with no terminator, run the test now with the parsed count (or the
+  // default if none was given).
+  if (parseState == 23 && (millis() - lastSerialTime > 50)) {
+    mechanicalTest(numLen > 0 ? (int)bufToLong(numBuf, numLen) : MECH_TEST_REVS);
     bufClear(numBuf, numLen);
     parseState = 0;
   }
