@@ -327,7 +327,7 @@ const unsigned long CSMA_LISTEN_MS = 20UL;
 // SRAM/heap on the 2 KB-SRAM ATtiny1616.  If you change this, keep its length
 // equal to NUM_FLAPS (set in USER CONFIGURATION above).
 const char FLAP_CHARS[] PROGMEM =
-  " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw";
+  " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;\":%↑.,/?↓roygbpw";
 
 // Return the flap index for a character, or -1 if not present.
 // Reads FLAP_CHARS from PROGMEM one byte at a time.
